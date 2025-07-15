@@ -1,0 +1,32 @@
+name: "Get Package Version"
+description: "Extract major, minor, and patch version from package.json"
+
+outputs:
+  version:
+    description: "Full version"
+    value: ${{ steps.project_version.outputs.version }}
+  major_version:
+    description: "Major version number"
+    value: ${{ steps.project_version.outputs.major_version }}
+  minor_version:
+    description: "Minor version number"
+    value: ${{ steps.project_version.outputs.minor_version }}
+  patch_version:
+    description: "Patch version number"
+    value: ${{ steps.project_version.outputs.patch_version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Read package.json version
+      id: project_version
+      shell: bash
+      run: |
+        version=$(jq -r '.version' package.json)
+        major=$(echo $version | cut -d. -f1)
+        minor=$(echo $version | cut -d. -f2)
+        patch=$(echo $version | cut -d. -f3)
+        echo "version=${version}" >> $GITHUB_OUTPUT
+        echo "major_version=${major}" >> $GITHUB_OUTPUT
+        echo "minor_version=${minor}" >> $GITHUB_OUTPUT
+        echo "patch_version=${patch}" >> $GITHUB_OUTPUT

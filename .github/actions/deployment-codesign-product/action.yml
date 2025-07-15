@@ -1,0 +1,133 @@
+name: Codesign Product
+description: Submit product to notary
+
+inputs:
+  sign:
+    required: true
+    type: string
+  keychain:
+    required: true
+    type: string
+  apple_id:
+    required: true
+    type: string 
+  team_id:
+    required: true
+    type: string 
+  password:
+    required: true
+    type: string 
+  product_path:
+    required: true
+    type: string
+  dmg_path:
+    required: true
+    type: string
+
+outputs:
+  product_path: 
+    value: ${{ inputs.product_path }}
+  dmg_path: 
+    value: ${{ inputs.dmg_path }}
+  notarization_status:
+    value: ${{ steps.notarytool.outputs.notarization_status }}
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: setup
+      id: setup
+      run: |
+        echo "dmg_path=${{ inputs.dmg_path }}" >> $GITHUB_OUTPUT
+        curl "${entitlements_url}" -o entitlements.plist -sL
+        echo "entitlements_path=${GITHUB_WORKSPACE}/entitlements.plist" >> $GITHUB_OUTPUT
+      shell: bash
+      env:
+        path: ${{ inputs.product_path }}
+        entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
+  
+    - name: codesign
+      id: codesign
+      continue-on-error: true
+      run: |
+        IFS=$'\n'; set -f
+        for f in $(find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.js" -o -name "*.json" -o -name "*.html" -o -name "*.so" \) | sort -r )
+        do codesign --verbose --options=runtime --timestamp --force --sign "${sign}" --keychain ${keychain} --entitlements "${entitlements_path}" "${f}"; 
+        done
+        for f in $(find "${product_path}" -type d \( -name "*.app" -o -name "*.framework" -o -name "*.bundle"  -o -name "*.plugin" -o -name "*.kext" \) | sort -r )
+        do codesign --verbose --options=runtime --timestamp --force --sign "${sign}" --keychain ${keychain} --entitlements "${entitlements_path}" "${f}"; 
+        done
+        unset IFS; set +f
+      shell: bash  
+      env:
+        sign: ${{ inputs.sign }}
+        keychain: ${{ inputs.keychain }}
+        product_path: ${{ inputs.product_path }}
+        entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
+
+    - name: hdiutil (create .cdr and convert to .dmg)
+      id: hdiutil
+      run: |
+        tmp_dmg="${dmg_path%.dmg}.tmp.dmg"
+
+        hdiutil create -format UDRW -srcfolder "${product_path}" -o "${tmp_dmg}"
+
+        if [[ ! -f "${tmp_dmg}" ]]; then
+          echo "ERREUR : fichier ${tmp_dmg} introuvable."
+          ls -l "$(dirname "${tmp_dmg}")"
+          exit 1
+        fi
+
+        hdiutil convert "${tmp_dmg}" -format UDBZ -o "${dmg_path}"
+        rm -f "${tmp_dmg}"
+      shell: bash
+      env:
+        product_path: ${{ inputs.product_path }}
+        dmg_path: ${{ steps.setup.outputs.dmg_path }}
+
+    - name: Debug notarization env vars
+      run: |
+        echo "Apple ID: ${apple_id}"
+        echo "Team ID: ${team_id}"
+        echo "Password is set: [${#password} characters]"
+      shell: bash
+      env:
+        apple_id: ${{ inputs.apple_id }}
+        team_id: ${{ inputs.team_id }}
+        password: ${{ inputs.password }}
+
+    - name: Notarize with Apple NotaryTool and check result
+      id: notarytool
+      shell: bash
+      run: |
+        echo "📦 Soumission à Apple NotaryTool..."
+        json_output_file="notarytool-output.json"
+        status_file="${GITHUB_WORKSPACE}/notarization_status.txt"
+
+        xcrun notarytool submit "${dmg_path}" \
+          --apple-id "${apple_id}" \
+          --team-id "${team_id}" \
+          --password "${password}" \
+          --wait \
+          --output-format json > "$json_output_file"
+
+        echo "📄 JSON brut généré par notarytool :"
+        cat "$json_output_file"
+
+        status=$(jq -r '.status // empty' "$json_output_file")
+        echo "🛡️ Statut de notarisation : $status"
+
+        echo "$status" > "$status_file"
+
+        if [[ "$status" != "Accepted" ]]; then
+          echo "❌ La notarisation a échoué ou n’a pas été acceptée. Statut : '$status'."
+          exit 1
+        fi
+
+        echo "✅ Notarisation réussie : statut accepté"
+      env:
+        apple_id: ${{ inputs.apple_id }}
+        team_id: ${{ inputs.team_id }}
+        password: ${{ inputs.password }}
+        dmg_path: ${{ steps.setup.outputs.dmg_path }}
