@@ -18,6 +18,7 @@ outputs:
 runs:
   using: "composite"
   steps:
+
     - name: Read package.json version
       id: project_version
       shell: bash

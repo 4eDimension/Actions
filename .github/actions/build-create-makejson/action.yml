@@ -1,0 +1,27 @@
+name: "build create makejson"
+description: "if the file make.json doesn't exist then it is being created with the informations in inputs"
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: git config 
+      run: |
+        git config --local user.name "GitHub Action"
+        git config --local user.email "action@github.com"  
+      shell: bash
+
+    - name: Create make.json
+      id: create_makejson
+      shell: bash
+      run: |
+        if [ ! -f make.json ]; then
+          echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]}}" > make.json
+          echo "make.json created."
+          git add make.json
+          git commit -m "Create make.json"
+          git push origin
+        else
+          echo "make.json already exists."
+        fi
+        echo "make_json_exists=$(test -f make.json && echo true || echo false)" >> $GITHUB_OUTPUT
