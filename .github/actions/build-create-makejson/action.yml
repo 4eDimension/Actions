@@ -1,22 +1,42 @@
 name: "build create makejson"
 description: "if the file make.json doesn't exist then it is being created with the informations in inputs"
+inputs:
+  version:
+    description: "Version of 4D"
+    required: true
+    # example: "20R7"
 
 runs:
   using: "composite"
   steps:
-
-    - name: git config 
+    - name: git config
       run: |
         git config --local user.name "GitHub Action"
-        git config --local user.email "action@github.com"  
+        git config --local user.email "action@github.com"
       shell: bash
+
+    - name: extract major version
+      id: extract_major_version
+      shell: bash
+      run: |
+        if [[ "${{ inputs.version }}" =~ ^([0-9]+) ]]; then
+          major_version="${BASH_REMATCH[1]}"
+        else
+          major_version="main"
+        fi
+        echo "major_version=${major_version}" >> $GITHUB_OUTPUT
 
     - name: Create make.json
       id: create_makejson
       shell: bash
       run: |
         if [ ! -f make.json ]; then
-          echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\"]}" > make.json
+          echo "Creating make.json for version: ${{ inputs.version }}"
+          if [ "${{ steps.extract_major_version.outputs.major_version }}" -gt 20 ] || [ "${{ steps.extract_major_version.outputs.major_version }}" == "main" ]; then
+            echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\",\"4D AIKit\"]}" > make.json
+          else
+            echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\"]}" > make.json
+          fi
           echo "make.json created."
           git add make.json
           git commit -m "Create make.json"
