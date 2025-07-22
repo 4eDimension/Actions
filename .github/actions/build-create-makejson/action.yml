@@ -16,7 +16,7 @@ runs:
       shell: bash
       run: |
         if [ ! -f make.json ]; then
-          echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]}}" > make.json
+          echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\"]}" > make.json
           echo "make.json created."
           git add make.json
           git commit -m "Create make.json"
