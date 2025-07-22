@@ -32,7 +32,9 @@ runs:
       run: |
         if [ ! -f make.json ]; then
           echo "Creating make.json for version: ${{ inputs.version }}"
-          if [ "${{ steps.extract_major_version.outputs.major_version }}" -gt 20 ] || [ "${{ steps.extract_major_version.outputs.major_version }}" == "main" ]; then
+          version="${{ steps.extract_major_version.outputs.major_version }}"
+          echo "Version: $version"
+          if [[ "$version" == "main" || "$version" -gt 20 ]]; then
             echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\",\"4D AIKit\"]}" > make.json
           else
             echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\"]}" > make.json
