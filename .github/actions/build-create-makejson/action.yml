@@ -41,6 +41,7 @@ runs:
             echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\"]}" > make.json
           fi
           echo "make.json created."
+          git config --global commit.gpgsign false
           git add make.json
           git commit -m "Create make.json"
           git push origin

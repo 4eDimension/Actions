@@ -28,6 +28,7 @@ runs:
         if [ ! -f package.json ]; then
           echo "{\"name\": \"${{ inputs.name }}\",\"version\": \"${{ inputs.version }}\",\"description\": \"\",\"main\": \"index.js\",\"type\": \"module\",\"scripts\": {\"release:major\": \"release-it major\",\"release:minor\": \"release-it minor\",\"release:patch\": \"release-it patch\"},\"devDependencies\": {\"dotenv\": \"^16.0.3\",\"form-data\": \"^4.0.0\",\"node-fetch\": \"^3.3.2\",\"release-it\": \"^15.10.1\"},\"engines\": {\"4d\": \">=20.2.0\"},\"keywords\": [],\"author\": \"\",\"license\": \"ISC\",\"dependencies\": {\"commander\": \"^11.0.0\"}}" > package.json
           echo "package.json created."
+          git config --global commit.gpgsign false
           git add package.json
           git commit -m "Create package.json"
           git push origin
