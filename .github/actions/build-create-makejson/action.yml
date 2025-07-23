@@ -30,6 +30,7 @@ runs:
       id: create_makejson
       shell: bash
       run: |
+        ls -la
         if [ ! -f make.json ]; then
           echo "Creating make.json for version: ${{ inputs.version }}"
           version="${{ steps.extract_major_version.outputs.major_version }}"
