@@ -23,19 +23,19 @@ runs:
     - name: major
       if: ${{ inputs.mode == 'major' }} 
       run: |
-        npm version major
+        npm version major --no-git-tag-version
       shell: bash
       
     - name: minor
       if: ${{ inputs.mode == 'minor' }} 
       run: |
-        npm version minor
+        npm version minor --no-git-tag-version
       shell: bash
       
     - name: patch
       if: ${{ inputs.mode == 'patch' }} 
       run: |
-        npm version patch
+        npm version patch --no-git-tag-version
       shell: bash
       
     - name: git push
