@@ -2,7 +2,7 @@ name: Set Package Version
 description: Write updated version code to package.json
 
 inputs:
-  mode: 
+  mode:
     required: true
     type: string
 
@@ -32,32 +32,51 @@ runs:
 
     - name: Handle version bump
       run: |
-        # Détection du mode
         MODE="${{ inputs.mode }}"
+        CURRENT_VERSION=$(jq -r .version package.json)
 
-        # Calcule la prochaine version avec npm dry-run
-        NEXT_VERSION=$(npm version "$MODE" --dry-run | grep -oP 'v?\d+\.\d+\.\d+' | tail -n1)
+        echo "📦 Version actuelle : $CURRENT_VERSION"
+
+        # Découpage de la version actuelle
+        IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+        # Incrément selon le mode
+        if [ "$MODE" == "major" ]; then
+          MAJOR=$((MAJOR + 1))
+          MINOR=0
+          PATCH=0
+        elif [ "$MODE" == "minor" ]; then
+          MINOR=$((MINOR + 1))
+          PATCH=0
+        elif [ "$MODE" == "patch" ]; then
+          PATCH=$((PATCH + 1))
+        else
+          echo "❌ Mode inconnu: $MODE"
+          exit 1
+        fi
+
+        NEXT_VERSION="$MAJOR.$MINOR.$PATCH"
         TAG="v$NEXT_VERSION"
 
-        echo "Tentative de version bump: $MODE → $NEXT_VERSION ($TAG)"
+        echo "🎯 Prochaine version : $NEXT_VERSION"
+        echo "🔖 Tag prévu : $TAG"
 
         # Si le tag existe localement
         if git rev-parse "$TAG" >/dev/null 2>&1; then
-          echo "Tag $TAG existe en local."
-          # Et s’il n’existe PAS à distance → suppression
+          echo "⚠️ Tag $TAG existe localement"
           if ! git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
-            echo "Tag $TAG n'existe pas à distance → suppression locale."
+            echo "🧹 Suppression du tag local $TAG (pas encore distant)"
             git tag -d "$TAG"
           else
-            echo "❌ Tag $TAG existe déjà à distance → abandon."
+            echo "❌ Tag $TAG existe déjà à distance → annulation"
             exit 1
           fi
         fi
 
-        # Exécute le bump réel et crée le tag
+        # Applique la version avec npm (création du tag)
         npm version "$MODE"
 
-        echo "✔️ Version bump réussi vers $NEXT_VERSION"
+        echo "✅ Version mise à jour avec succès : $NEXT_VERSION"
       shell: bash
 
     - name: Push commit and tag
