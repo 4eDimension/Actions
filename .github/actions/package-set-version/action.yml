@@ -13,11 +13,16 @@ outputs:
 runs:
   using: "composite"
   steps:   
-    
+
     - name: git config 
       run: |
         git config --local user.name "GitHub Action"
         git config --local user.email "action@github.com"  
+      shell: bash
+
+    - name: git pull
+      run: |
+        git pull origin main
       shell: bash
       
     - name: major
@@ -40,7 +45,7 @@ runs:
       
     - name: git push
       run: |
-        git push origin
+        git push origin main
       shell: bash
       
     - id: set
