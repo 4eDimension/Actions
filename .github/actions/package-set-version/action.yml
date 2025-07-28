@@ -1,55 +1,99 @@
 name: Set Package Version
 description: Write updated version code to package.json
+
 inputs:
-   mode: 
-     required: true
-     type: string
+  mode: 
+    required: true
+    type: string
+
 outputs:
-   version:
-     value: ${{ steps.set.outputs.version }}
-   mode:
-     value: ${{ inputs.mode }}
+  version:
+    value: ${{ steps.set.outputs.version }}
+  mode:
+    value: ${{ inputs.mode }}
 
 runs:
   using: "composite"
-  steps:   
+  steps:
 
-    - name: git config 
+    - name: Configure Git
       run: |
         git config --local user.name "GitHub Action"
-        git config --local user.email "action@github.com"  
+        git config --local user.email "action@github.com"
       shell: bash
 
-    - name: git pull
-      run: |
-        git pull origin main
+    - name: Pull latest changes
+      run: git pull origin main
       shell: bash
-      
-    - name: major
-      if: ${{ inputs.mode == 'major' }} 
-      run: |
-        npm version major
+
+    - name: Fetch all tags
+      run: git fetch --tags
       shell: bash
-      
-    - name: minor
-      if: ${{ inputs.mode == 'minor' }} 
+
+    - name: Clean local tag if needed (major)
+      if: ${{ inputs.mode == 'major' }}
       run: |
-        npm version minor
+        CURRENT_VERSION=$(jq -r '.version' package.json)
+        NEXT_VERSION=$(npm version major --dry-run | tail -n 1 | awk '{print $2}')
+        TAG="v$NEXT_VERSION"
+        # Si tag local existe mais pas à distance, on le supprime
+        if git show-ref --tags "$TAG" >/dev/null 2>&1; then
+          if ! git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+            echo "Tag $TAG exists locally but not remotely. Deleting local tag."
+            git tag -d "$TAG"
+          fi
+        fi
       shell: bash
-      
-    - name: patch
-      if: ${{ inputs.mode == 'patch' }} 
+
+    - name: Clean local tag if needed (minor)
+      if: ${{ inputs.mode == 'minor' }}
       run: |
-        npm version patch
+        CURRENT_VERSION=$(jq -r '.version' package.json)
+        NEXT_VERSION=$(npm version minor --dry-run | tail -n 1 | awk '{print $2}')
+        TAG="v$NEXT_VERSION"
+        if git show-ref --tags "$TAG" >/dev/null 2>&1; then
+          if ! git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+            echo "Tag $TAG exists locally but not remotely. Deleting local tag."
+            git tag -d "$TAG"
+          fi
+        fi
       shell: bash
-      
-    - name: git push
+
+    - name: Clean local tag if needed (patch)
+      if: ${{ inputs.mode == 'patch' }}
       run: |
-        git push origin main
+        CURRENT_VERSION=$(jq -r '.version' package.json)
+        NEXT_VERSION=$(npm version patch --dry-run | tail -n 1 | awk '{print $2}')
+        TAG="v$NEXT_VERSION"
+        if git show-ref --tags "$TAG" >/dev/null 2>&1; then
+          if ! git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+            echo "Tag $TAG exists locally but not remotely. Deleting local tag."
+            git tag -d "$TAG"
+          fi
+        fi
       shell: bash
-      
+
+    - name: Set version (major)
+      if: ${{ inputs.mode == 'major' }}
+      run: npm version major
+      shell: bash
+
+    - name: Set version (minor)
+      if: ${{ inputs.mode == 'minor' }}
+      run: npm version minor
+      shell: bash
+
+    - name: Set version (patch)
+      if: ${{ inputs.mode == 'patch' }}
+      run: npm version patch
+      shell: bash
+
+    - name: Push changes
+      run: git push origin main --follow-tags
+      shell: bash
+
     - id: set
       run: |
-        version=`cat package.json | jq -r '.version'`
-        echo "version=${version}" >> $GITHUB_OUTPUT
-      shell: bash  
+        version=$(jq -r '.version' package.json)
+        echo "version=${version}" >> "$GITHUB_OUTPUT"
+      shell: bash
