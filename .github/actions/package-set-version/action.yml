@@ -26,69 +26,41 @@ runs:
       run: git pull origin main
       shell: bash
 
-    - name: Fetch all tags
+    - name: Fetch remote tags
       run: git fetch --tags
       shell: bash
 
-    - name: Clean local tag if needed (major)
-      if: ${{ inputs.mode == 'major' }}
+    - name: Handle version bump
       run: |
-        CURRENT_VERSION=$(jq -r '.version' package.json)
-        NEXT_VERSION=$(npm version major --dry-run | tail -n 1 | awk '{print $2}')
+        # Détection du mode
+        MODE="${{ inputs.mode }}"
+
+        # Calcule la prochaine version avec npm dry-run
+        NEXT_VERSION=$(npm version "$MODE" --dry-run | grep -oP 'v?\d+\.\d+\.\d+' | tail -n1)
         TAG="v$NEXT_VERSION"
-        # Si tag local existe mais pas à distance, on le supprime
-        if git show-ref --tags "$TAG" >/dev/null 2>&1; then
+
+        echo "Tentative de version bump: $MODE → $NEXT_VERSION ($TAG)"
+
+        # Si le tag existe localement
+        if git rev-parse "$TAG" >/dev/null 2>&1; then
+          echo "Tag $TAG existe en local."
+          # Et s’il n’existe PAS à distance → suppression
           if ! git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
-            echo "Tag $TAG exists locally but not remotely. Deleting local tag."
+            echo "Tag $TAG n'existe pas à distance → suppression locale."
             git tag -d "$TAG"
+          else
+            echo "❌ Tag $TAG existe déjà à distance → abandon."
+            exit 1
           fi
         fi
+
+        # Exécute le bump réel et crée le tag
+        npm version "$MODE"
+
+        echo "✔️ Version bump réussi vers $NEXT_VERSION"
       shell: bash
 
-    - name: Clean local tag if needed (minor)
-      if: ${{ inputs.mode == 'minor' }}
-      run: |
-        CURRENT_VERSION=$(jq -r '.version' package.json)
-        NEXT_VERSION=$(npm version minor --dry-run | tail -n 1 | awk '{print $2}')
-        TAG="v$NEXT_VERSION"
-        if git show-ref --tags "$TAG" >/dev/null 2>&1; then
-          if ! git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
-            echo "Tag $TAG exists locally but not remotely. Deleting local tag."
-            git tag -d "$TAG"
-          fi
-        fi
-      shell: bash
-
-    - name: Clean local tag if needed (patch)
-      if: ${{ inputs.mode == 'patch' }}
-      run: |
-        CURRENT_VERSION=$(jq -r '.version' package.json)
-        NEXT_VERSION=$(npm version patch --dry-run | tail -n 1 | awk '{print $2}')
-        TAG="v$NEXT_VERSION"
-        if git show-ref --tags "$TAG" >/dev/null 2>&1; then
-          if ! git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
-            echo "Tag $TAG exists locally but not remotely. Deleting local tag."
-            git tag -d "$TAG"
-          fi
-        fi
-      shell: bash
-
-    - name: Set version (major)
-      if: ${{ inputs.mode == 'major' }}
-      run: npm version major
-      shell: bash
-
-    - name: Set version (minor)
-      if: ${{ inputs.mode == 'minor' }}
-      run: npm version minor
-      shell: bash
-
-    - name: Set version (patch)
-      if: ${{ inputs.mode == 'patch' }}
-      run: npm version patch
-      shell: bash
-
-    - name: Push changes
+    - name: Push commit and tag
       run: git push origin main --follow-tags
       shell: bash
 
