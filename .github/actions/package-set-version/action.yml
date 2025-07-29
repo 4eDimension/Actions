@@ -27,7 +27,7 @@ runs:
       shell: bash
 
     - name: Fetch remote tags
-      run: git fetch --tags
+      run: git fetch --tags --force
       shell: bash
 
     - name: Handle version bump
