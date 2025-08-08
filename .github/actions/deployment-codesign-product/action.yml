@@ -66,25 +66,101 @@ runs:
         product_path: ${{ inputs.product_path }}
         entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
 
-    - name: hdiutil (create .cdr and convert to .dmg)
+    - name: hdiutil (sparse -> convert)
       id: hdiutil
-      run: |
-        tmp_dmg="${dmg_path%.dmg}.tmp.dmg"
-
-        hdiutil create -format UDRW -srcfolder "${product_path}" -o "${tmp_dmg}"
-
-        if [[ ! -f "${tmp_dmg}" ]]; then
-          echo "ERREUR : fichier ${tmp_dmg} introuvable."
-          ls -l "$(dirname "${tmp_dmg}")"
-          exit 1
-        fi
-
-        hdiutil convert "${tmp_dmg}" -format UDBZ -o "${dmg_path}"
-        rm -f "${tmp_dmg}"
       shell: bash
       env:
         product_path: ${{ inputs.product_path }}
         dmg_path: ${{ steps.setup.outputs.dmg_path }}
+        FS: HFS+                 # ou APFS si tu préfères
+        FORMAT: UDBZ             # UDBZ (bzip2) ou UDZO (zlib)
+        MARGIN_PCT: "50"         # marge % au-dessus de la taille source
+        EXTRA_MB: "500"          # marge fixe supplémentaire en MB
+        VERIFY: "1"              # 0 pour désactiver verify
+      run: |
+        set -euo pipefail
+
+        SRC="${product_path}"
+        OUT="${dmg_path}"
+        VOLNAME="$(basename "${OUT%.dmg}")"   # nom du volume = nom du .dmg
+        WORKDIR="$(mktemp -d /tmp/dmgbuild.XXXXXX)"
+        LOG="${WORKDIR}/build.log"
+        STAGING="${WORKDIR}/staging.sparseimage"
+        ATTACH_PLIST="${WORKDIR}/attach.plist"
+        MOUNT_DIR="${WORKDIR}/mnt"
+        mkdir -p "$MOUNT_DIR"
+
+        echo "[i] Workdir: $WORKDIR"
+        echo "[i] SRC=$SRC"
+        echo "[i] OUT=$OUT"
+        echo "[i] VOLNAME=$VOLNAME"
+
+        if [[ ! -e "$SRC" ]]; then
+          echo "[!] Source introuvable: $SRC"
+          exit 1
+        fi
+
+        # --- Estimation taille (auto) ---
+        SRC_KB=$(du -sk "$SRC" | awk '{print $1}')
+        SRC_MB=$(( SRC_KB / 1024 ))
+        if [[ $SRC_MB -lt 1 ]]; then SRC_MB=1; fi
+        NEEDED_MB=$(( SRC_MB + (SRC_MB * ${MARGIN_PCT} / 100) + ${EXTRA_MB} ))
+        if [[ $NEEDED_MB -lt 300 ]]; then NEEDED_MB=300; fi
+        echo "[i] Payload size: $(du -sh "$SRC" | awk '{print $1}'); staging ceil: ${NEEDED_MB} MB"
+
+        # --- Création sparseimage (élastique) ---
+        hdiutil create -type SPARSE -fs "${FS}" -volname "${VOLNAME}" -nospotlight \
+          -size "${NEEDED_MB}m" -ov "${STAGING}"
+
+        # --- Montage contrôlé (pas de /Volumes/test 1) ---
+        hdiutil attach "${STAGING}" -nobrowse -noverify -noautoopen -owners on \
+          -mountpoint "${MOUNT_DIR}" -plist > "${ATTACH_PLIST}"
+
+        # Petite protection anti-indexation
+        touch "${MOUNT_DIR}/.metadata_never_index" || true
+
+        # --- Copie du contenu ---
+        rsync -a --delete "${SRC}" "${MOUNT_DIR}/"
+
+        # --- Sync + detach robuste ---
+        sync
+        mdutil -i off "${MOUNT_DIR}" >/dev/null 2>&1 || true
+
+        detach_ok=0
+        for i in {1..8}; do
+          if hdiutil detach "${MOUNT_DIR}" -quiet; then
+            detach_ok=1; echo "[i] Detached OK"; break
+          else
+            echo "[warn] Detach failed (try $i). Showing lsof & poking Spotlight/QuickLook…"
+            lsof +D "${MOUNT_DIR}" || true
+            pkill -f mdworker || true
+            pkill -f quicklookd || true
+            sleep 2
+            if [[ $i -eq 8 ]]; then
+              echo "[warn] Forcing detach…"
+              hdiutil detach -force "${MOUNT_DIR}" || true
+            fi
+          fi
+        done
+        if [[ $detach_ok -eq 0 ]]; then
+          echo "[warn] Forced detach may have been needed"
+        fi
+
+        # --- Compact avant conversion (réduit la sparse) ---
+        hdiutil compact "${STAGING}" || true
+
+        # --- Conversion finale (.dmg compressé) ---
+        hdiutil convert "${STAGING}" -format "${FORMAT}" -o "${OUT}" -ov
+
+        # --- Verify (optionnel) ---
+        if [[ "${VERIFY}" == "1" ]]; then
+          hdiutil verify "${OUT}"
+        fi
+
+        echo "[✓] DMG prêt: ${OUT}"
+        echo "[i] Log (temp): ${LOG}"
+
+
 
     - name: Debug notarization env vars
       run: |
