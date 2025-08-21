@@ -49,17 +49,52 @@ runs:
   
     - name: codesign
       id: codesign
-      continue-on-error: true
       run: |
+        retry_codesign() {
+          local target="$1"
+          local attempt=1
+          local max_attempts=5
+          local delay=5
+
+          while [ $attempt -le $max_attempts ]; do
+            echo "[$attempt/$max_attempts] codesign de: $target"
+            if codesign --verbose --options=runtime --timestamp --force \
+              --sign "${sign}" --keychain "${keychain}" \
+              --entitlements "${entitlements_path}" "$target"; then
+              echo "✅ codesign réussi pour $target"
+              return 0
+            fi
+
+            # Vérifie si c'est l'erreur de timestamp
+            if grep -q "The timestamp service is not available" <<< "$(codesign --verbose --options=runtime --timestamp --force \
+              --sign "${sign}" --keychain "${keychain}" \
+              --entitlements "${entitlements_path}" "$target" 2>&1)"; then
+              echo "⚠️ Timestamp service non dispo, tentative $attempt échouée..."
+              attempt=$(( attempt + 1 ))
+              sleep $delay
+              delay=$(( delay * 2 )) # backoff exponentiel
+            else
+              echo "❌ Autre erreur rencontrée, arrêt."
+              return 1
+            fi
+          done
+
+          echo "❌ Échec après $max_attempts tentatives pour $target"
+          return 1
+        }
+
         IFS=$'\n'; set -f
         for f in $(find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.js" -o -name "*.json" -o -name "*.html" -o -name "*.so" \) | sort -r )
-        do codesign --verbose --options=runtime --timestamp --force --sign "${sign}" --keychain ${keychain} --entitlements "${entitlements_path}" "${f}"; 
+        do
+          retry_codesign "$f" || exit 1
         done
-        for f in $(find "${product_path}" -type d \( -name "*.app" -o -name "*.framework" -o -name "*.bundle"  -o -name "*.plugin" -o -name "*.kext" \) | sort -r )
-        do codesign --verbose --options=runtime --timestamp --force --sign "${sign}" --keychain ${keychain} --entitlements "${entitlements_path}" "${f}"; 
+
+        for f in $(find "${product_path}" -type d \( -name "*.app" -o -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) | sort -r )
+        do
+          retry_codesign "$f" || exit 1
         done
         unset IFS; set +f
-      shell: bash  
+      shell: bash
       env:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
