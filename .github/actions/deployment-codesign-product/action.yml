@@ -58,17 +58,21 @@ runs:
 
           while [ $attempt -le $max_attempts ]; do
             echo "[$attempt/$max_attempts] codesign de: $target"
-            if codesign --verbose --options=runtime --timestamp --force \
+            
+            # Capture stdout+stderr dans une variable
+            output=$(codesign --verbose --options=runtime --timestamp --force \
               --sign "${sign}" --keychain "${keychain}" \
-              --entitlements "${entitlements_path}" "$target"; then
+              --entitlements "${entitlements_path}" "$target" 2>&1)
+
+            status=$?
+            echo "$output"
+
+            if [ $status -eq 0 ]; then
               echo "✅ codesign réussi pour $target"
               return 0
             fi
 
-            # Vérifie si c'est l'erreur de timestamp
-            if grep -q "The timestamp service is not available" <<< "$(codesign --verbose --options=runtime --timestamp --force \
-              --sign "${sign}" --keychain "${keychain}" \
-              --entitlements "${entitlements_path}" "$target" 2>&1)"; then
+            if echo "$output" | grep -q "The timestamp service is not available"; then
               echo "⚠️ Timestamp service non dispo, tentative $attempt échouée..."
               attempt=$(( attempt + 1 ))
               sleep $delay
