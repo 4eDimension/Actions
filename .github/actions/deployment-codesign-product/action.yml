@@ -219,14 +219,14 @@ runs:
         json_output_file="notarytool-output.json"
         status_file="${GITHUB_WORKSPACE}/notarization_status.txt"
 
-        # soumission (on garde les erreurs visibles dans la console CI)
+        # soumission (stdout → fichier JSON, stderr → console)
         if ! xcrun notarytool submit "${dmg_path}" \
           --apple-id "${apple_id}" \
           --team-id "${team_id}" \
           --password "${password}" \
           --wait \
           --output-format json \
-          -o "$json_output_file"; then
+          1>"$json_output_file"; then
           echo "❌ Erreur lors de l’exécution de notarytool (avant réception du JSON)."
           exit 1
         fi
