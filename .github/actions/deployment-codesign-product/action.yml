@@ -218,45 +218,48 @@ runs:
 
         json_output_file="notarytool-output.json"
         status_file="${GITHUB_WORKSPACE}/notarization_status.txt"
-        max_retries=5
-        attempt=1
-        delay=60  # secondes à attendre entre chaque tentative
 
-        while [[ $attempt -le $max_retries ]]; do
-          echo "🔄 Tentative $attempt / $max_retries..."
+        # soumission (on garde les erreurs visibles dans la console CI)
+        if ! xcrun notarytool submit "${dmg_path}" \
+          --apple-id "${apple_id}" \
+          --team-id "${team_id}" \
+          --password "${password}" \
+          --wait \
+          --output-format json \
+          -o "$json_output_file"; then
+          echo "❌ Erreur lors de l’exécution de notarytool (avant réception du JSON)."
+          exit 1
+        fi
 
-          # soumission
-          xcrun notarytool submit "${dmg_path}" \
-            --apple-id "${apple_id}" \
-            --team-id "${team_id}" \
-            --password "${password}" \
-            --wait \
-            --output-format json > "$json_output_file" 2>&1
+        # affichage du JSON brut
+        echo "📄 JSON brut généré par notarytool :"
+        cat "$json_output_file" || true
 
-          # affichage du JSON brut
-          echo "📄 JSON brut généré par notarytool :"
-          cat "$json_output_file" || true
+        # extraction statut et id
+        status=$(jq -r '.status // empty' "$json_output_file" 2>/dev/null || echo "Unknown")
+        submission_id=$(jq -r '.id // empty' "$json_output_file" 2>/dev/null || echo "")
 
-          # extraction statut
-          status=$(jq -r '.status // empty' "$json_output_file" 2>/dev/null || echo "Unknown")
-          echo "🛡️ Statut de notarisation : $status"
-          echo "$status" > "$status_file"
+        echo "🛡️ Statut de notarisation : $status"
+        echo "$status" > "$status_file"
 
-          if [[ "$status" == "Accepted" ]]; then
-            echo "✅ Notarisation réussie : statut accepté"
-            exit 0
-          elif [[ "$status" == "Invalid" ]]; then
-            echo "⚠️ Notarisation 'Invalid', on attend $delay secondes avant de réessayer..."
-            sleep $delay
-            ((attempt++))
-          else
-            echo "❌ La notarisation a échoué avec statut inattendu : '$status'."
-            exit 1
+        if [[ "$status" == "Accepted" ]]; then
+          echo "✅ Notarisation réussie : statut accepté"
+          exit 0
+        elif [[ "$status" == "Invalid" ]]; then
+          echo "❌ La notarisation a été rejetée (Invalid)."
+          if [[ -n "$submission_id" ]]; then
+            echo "📥 Récupération du log Apple pour la soumission : $submission_id"
+            xcrun notarytool log "$submission_id" \
+              --apple-id "${apple_id}" \
+              --team-id "${team_id}" \
+              --password "${password}" \
+              --output-format text || true
           fi
-        done
-
-        echo "❌ Échec après $max_retries tentatives de notarisation."
-        exit 1
+          exit 1
+        else
+          echo "❌ La notarisation a échoué avec statut inattendu : '$status'."
+          exit 1
+        fi
       env:
         apple_id: ${{ inputs.apple_id }}
         team_id: ${{ inputs.team_id }}
