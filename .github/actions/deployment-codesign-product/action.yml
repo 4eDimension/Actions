@@ -253,7 +253,7 @@ runs:
               --apple-id "${apple_id}" \
               --team-id "${team_id}" \
               --password "${password}" \
-              --output-format text || true
+              --output-format normal || true
           fi
           exit 1
         else
