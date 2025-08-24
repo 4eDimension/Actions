@@ -58,8 +58,7 @@ runs:
 
           while [ $attempt -le $max_attempts ]; do
             echo "[$attempt/$max_attempts] codesign de: $target"
-            
-            # Capture stdout+stderr dans une variable
+
             output=$(codesign --verbose --options=runtime --timestamp --force \
               --sign "${sign}" --keychain "${keychain}" \
               --entitlements "${entitlements_path}" "$target" 2>&1)
@@ -72,31 +71,36 @@ runs:
               return 0
             fi
 
-            if echo "$output" | grep -q "The timestamp service is not available"; then
-              echo "⚠️ Timestamp service non dispo, tentative $attempt échouée..."
-              attempt=$(( attempt + 1 ))
-              sleep $delay
-              delay=$(( delay * 2 )) # backoff exponentiel
-            else
-              echo "❌ Autre erreur rencontrée, arrêt."
+            # erreurs considérées comme fatales → pas de retry
+            if echo "$output" | grep -qE "no identity found|password|resource fork|invalid|not found in keychain"; then
+              echo "❌ Erreur fatale détectée, arrêt immédiat."
               return 1
             fi
+
+            # sinon → retry avec backoff exponentiel
+            echo "⚠️ Tentative $attempt échouée, nouvelle tentative dans ${delay}s..."
+            attempt=$(( attempt + 1 ))
+            sleep $delay
+            delay=$(( delay * 2 ))
           done
 
           echo "❌ Échec après $max_attempts tentatives pour $target"
           return 1
         }
 
+        # désactive le globbing pour éviter les soucis avec les noms de fichiers contenant *
         IFS=$'\n'; set -f
-        for f in $(find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.js" -o -name "*.json" -o -name "*.html" -o -name "*.so" \) | sort -r )
-        do
+
+        # signer tous les fichiers exécutables + bibliothèques
+        for f in $(find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" -o -name "*.js" -o -name "*.json" -o -name "*.html" \) | sort -r ); do
           retry_codesign "$f" || exit 1
         done
 
-        for f in $(find "${product_path}" -type d \( -name "*.app" -o -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) | sort -r )
-        do
+        # signer les bundles (.app, .framework, etc.)
+        for f in $(find "${product_path}" -type d \( -name "*.app" -o -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) | sort -r ); do
           retry_codesign "$f" || exit 1
         done
+
         unset IFS; set +f
       shell: bash
       env:
