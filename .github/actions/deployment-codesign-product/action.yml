@@ -49,6 +49,7 @@ runs:
   
     - name: codesign
       id: codesign
+      shell: bash
       run: |
         retry_codesign() {
           local target="$1"
@@ -62,7 +63,6 @@ runs:
             output=$(codesign --verbose --options=runtime --timestamp --force \
               --sign "${sign}" --keychain "${keychain}" \
               --entitlements "${entitlements_path}" "$target" 2>&1)
-
             status=$?
             echo "$output"
 
@@ -71,7 +71,7 @@ runs:
               return 0
             fi
 
-            # 🔴 erreurs fatales = on arrête direct (inutile de retenter)
+            # erreurs fatales → arrêt immédiat
             if echo "$output" | grep -qiE "no identity found|password|resource fork|invalid|not found in keychain|code object is not signed at all"; then
               echo "❌ Erreur fatale détectée, arrêt immédiat."
               return 1
@@ -89,8 +89,8 @@ runs:
 
         IFS=$'\n'; set -f
 
-        echo "=== Étape 1 : signer tous les exécutables/fichiers binaires ==="
-        find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) \
+        echo "=== Étape 1 : signer tous les fichiers binaires (.dylib, .so, exécutables) ==="
+        find "${product_path}" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
           | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
           | while read f; do
               retry_codesign "$f" || exit 1
@@ -103,14 +103,14 @@ runs:
               retry_codesign "$f" || exit 1
             done
 
-        echo "=== Étape 3 : signer les bundles/plugins (du plus profond au plus haut) ==="
+        echo "=== Étape 3 : signer les bundles/plugins/kexts (du plus profond au plus haut) ==="
         find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) \
           | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
           | while read f; do
               retry_codesign "$f" || exit 1
             done
 
-        echo "=== Étape 4 : signer les applications (du plus profond au plus haut) ==="
+        echo "=== Étape 4 : signer les applications (.app) du plus profond au plus haut ==="
         find "${product_path}" -type d -name "*.app" \
           | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
           | while read f; do
@@ -118,7 +118,8 @@ runs:
             done
 
         unset IFS; set +f
-      shell: bash
+
+        echo "✅ Tous les composants sont signés correctement."
       env:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
