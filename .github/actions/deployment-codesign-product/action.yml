@@ -71,7 +71,8 @@ runs:
               return 0
             fi
 
-            if echo "$output" | grep -qE "no identity found|password|resource fork|invalid|not found in keychain"; then
+            # 🔴 erreurs fatales = on arrête direct (inutile de retenter)
+            if echo "$output" | grep -qiE "no identity found|password|resource fork|invalid|not found in keychain|code object is not signed at all"; then
               echo "❌ Erreur fatale détectée, arrêt immédiat."
               return 1
             fi
@@ -88,9 +89,9 @@ runs:
 
         IFS=$'\n'; set -f
 
-        echo "=== Étape 1 : signer tous les fichiers exécutables ==="
-        find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" -o -name "*.js" -o -name "*.json" -o -name "*.html" \) \
-          | sort -r \
+        echo "=== Étape 1 : signer tous les exécutables/fichiers binaires ==="
+        find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) \
+          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
           | while read f; do
               retry_codesign "$f" || exit 1
             done
