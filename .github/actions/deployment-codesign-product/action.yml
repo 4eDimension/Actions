@@ -118,14 +118,23 @@ runs:
 
         unset IFS; set +f
 
-        echo "=== Étape 5 : signature finale de l’app principale ==="
-        retry_codesign "${product_path}" || exit 1
+        echo "=== Étape 5 : signature finale du paquet racine si applicable ==="
+        if [[ "${product_path}" == *.app ]]; then
+          echo "📦 Signature finale de l’app principale : ${product_path}"
+          retry_codesign "${product_path}" || exit 1
+        else
+          echo "ℹ️ ${product_path} n’est pas une .app (ex: .4dbase), pas de signature racine."
+        fi
 
         echo "=== Étape 6 : vérification stricte ==="
-        codesign --verify --deep --strict --verbose=2 "${product_path}"
-        spctl --assess --type execute --verbose=4 "${product_path}"
+        if [[ "${product_path}" == *.app ]]; then
+          codesign --verify --deep --strict --verbose=2 "${product_path}"
+          spctl --assess --type execute --verbose=4 "${product_path}"
+        else
+          echo "ℹ️ Vérification spctl/codesign sautée (non applicable aux .4dbase)."
+        fi
 
-        echo "✅ Tous les composants sont signés correctement."
+        echo "✅ Tous les composants ont été signés correctement."
       env:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
