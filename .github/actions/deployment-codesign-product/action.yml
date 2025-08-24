@@ -71,13 +71,11 @@ runs:
               return 0
             fi
 
-            # erreurs considérées comme fatales → pas de retry
             if echo "$output" | grep -qE "no identity found|password|resource fork|invalid|not found in keychain"; then
               echo "❌ Erreur fatale détectée, arrêt immédiat."
               return 1
             fi
 
-            # sinon → retry avec backoff exponentiel
             echo "⚠️ Tentative $attempt échouée, nouvelle tentative dans ${delay}s..."
             attempt=$(( attempt + 1 ))
             sleep $delay
@@ -88,18 +86,35 @@ runs:
           return 1
         }
 
-        # désactive le globbing pour éviter les soucis avec les noms de fichiers contenant *
         IFS=$'\n'; set -f
 
-        # signer tous les fichiers exécutables + bibliothèques
-        for f in $(find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" -o -name "*.js" -o -name "*.json" -o -name "*.html" \) | sort -r ); do
-          retry_codesign "$f" || exit 1
-        done
+        echo "=== Étape 1 : signer tous les fichiers exécutables ==="
+        find "${product_path}" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" -o -name "*.js" -o -name "*.json" -o -name "*.html" \) \
+          | sort -r \
+          | while read f; do
+              retry_codesign "$f" || exit 1
+            done
 
-        # signer les bundles (.app, .framework, etc.)
-        for f in $(find "${product_path}" -type d \( -name "*.app" -o -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) | sort -r ); do
-          retry_codesign "$f" || exit 1
-        done
+        echo "=== Étape 2 : signer les frameworks (du plus profond au plus haut) ==="
+        find "${product_path}" -type d -name "*.framework" \
+          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
+          | while read f; do
+              retry_codesign "$f" || exit 1
+            done
+
+        echo "=== Étape 3 : signer les bundles/plugins (du plus profond au plus haut) ==="
+        find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) \
+          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
+          | while read f; do
+              retry_codesign "$f" || exit 1
+            done
+
+        echo "=== Étape 4 : signer les applications (du plus profond au plus haut) ==="
+        find "${product_path}" -type d -name "*.app" \
+          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
+          | while read f; do
+              retry_codesign "$f" || exit 1
+            done
 
         unset IFS; set +f
       shell: bash
