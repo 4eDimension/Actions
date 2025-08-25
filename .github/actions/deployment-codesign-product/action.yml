@@ -47,34 +47,51 @@ runs:
         path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
-    - name: Fix invalid symlinks in WebViewerCEF.bundle
+    - name: Fix all invalid symlinks in WebViewerCEF.bundle (Robust)
       shell: bash
       run: |
-        BUNDLE_PATH="${GITHUB_WORKSPACE}/AutoTestExec/AutoTestExec/Build/Client/AutoTestExec Client.app/Contents/Native Components/WebViewerCEF.bundle/Contents/Frameworks/4D Helper (Plugin).app/Contents/Frameworks"
+        set -e
 
-        echo "🔍 Vérification des symlinks dans $BUNDLE_PATH"
+        # Cherche le dossier Frameworks de WebViewerCEF
+        BUNDLE_ROOT=$(find "$GITHUB_WORKSPACE" -type d -path "*WebViewerCEF.bundle/Contents/Frameworks" | head -n 1)
 
-        # Parcours tous les symlinks
-        find "$BUNDLE_PATH" -type l | while read symlink; do
-          TARGET=$(readlink "$symlink")
-          
-          # Vérifie si la cible existe
-          if [ ! -e "$symlink/../$TARGET" ]; then
-            echo "⚠ Symlink cassé trouvé: $symlink -> $TARGET"
-            
-            # Supprime le symlink cassé
-            rm "$symlink"
-            
-            # Tente de copier le fichier réel à la place
-            if [ -e "$BUNDLE_PATH/$TARGET" ]; then
-              echo "📦 Remplacement par copie réelle"
-              cp -R "$BUNDLE_PATH/$TARGET" "$symlink"
-            else
-              echo "❌ Impossible de réparer: cible inexistante, vérifie ton bundle"
-              exit 1
+        if [ -z "$BUNDLE_ROOT" ]; then
+          echo "❌ Impossible de trouver le dossier WebViewerCEF.bundle/Contents/Frameworks"
+          exit 1
+        fi
+
+        echo "🔍 Vérification et réparation des symlinks dans $BUNDLE_ROOT ..."
+
+        # Fonction pour réparer les symlinks
+        fix_symlinks() {
+          local DIR="$1"
+          find "$DIR" -type l | while read SYMLINK; do
+            TARGET=$(readlink "$SYMLINK")
+            # Vérifie si la cible existe par rapport au symlink
+            if [ ! -e "$(dirname "$SYMLINK")/$TARGET" ]; then
+              echo "⚠ Symlink cassé: $SYMLINK -> $TARGET"
+              rm "$SYMLINK"
+              # Essayons de copier la cible si elle existe quelque part dans le bundle
+              BASENAME=$(basename "$TARGET")
+              FOUND=$(find "$BUNDLE_ROOT" -name "$BASENAME" | head -n 1)
+              if [ -n "$FOUND" ]; then
+                echo "📦 Remplacement par copie réelle: $FOUND"
+                cp -R "$FOUND" "$(dirname "$SYMLINK")/"
+              else
+                echo "❌ Impossible de réparer: cible inexistante"
+              fi
             fi
-          fi
+          done
+        }
+
+        # Répare les symlinks dans le root
+        fix_symlinks "$BUNDLE_ROOT"
+
+        # Répare les symlinks dans tous les sous-bundles et apps imbriqués
+        find "$BUNDLE_ROOT" -type d \( -name "*.bundle" -o -name "*.app" \) | while read SUBDIR; do
+          fix_symlinks "$SUBDIR"
         done
+
         echo "✅ Tous les symlinks valides ou réparés."
   
     - name: codesign
