@@ -47,22 +47,21 @@ runs:
         path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
-    - name: Fix all invalid symlinks in WebViewerCEF.bundle
+    - name: codesign
       shell: bash
       run: |
         set -e
 
-        # Cherche le dossier Frameworks de WebViewerCEF
+        ##############################
+        # 1️⃣ Fix des symlinks cassés
+        ##############################
         BUNDLE_ROOT=$(find "$GITHUB_WORKSPACE" -type d -path "*WebViewerCEF.bundle/Contents/Frameworks" | head -n 1)
-
         if [ -z "$BUNDLE_ROOT" ]; then
           echo "❌ Impossible de trouver le dossier WebViewerCEF.bundle/Contents/Frameworks"
           exit 1
         fi
-
         echo "🔍 Vérification et réparation des symlinks dans $BUNDLE_ROOT ..."
 
-        # Fonction pour réparer les symlinks
         fix_symlinks() {
           local DIR="$1"
           find "$DIR" -type l | while read SYMLINK; do
@@ -70,16 +69,6 @@ runs:
             if [ ! -e "$(dirname "$SYMLINK")/$TARGET" ]; then
               echo "⚠ Symlink cassé: $SYMLINK -> $TARGET"
               rm "$SYMLINK"
-
-              # Cas particulier pour 4D Helper (Plugin)
-              if [[ "$SYMLINK" == *"4D Helper (Plugin).app/Contents/Frameworks/Chromium Embedded Framework.framework" ]]; then
-                echo "🔧 Correction du symlink spécifique pour 4D Helper (Plugin)"
-                ln -s ../../Chromium\ Embedded\ Framework.framework "$(dirname "$SYMLINK")/"
-                echo "✔ Symlink réparé."
-                continue
-              fi
-
-              # Sinon essaye de copier la cible si elle existe quelque part dans le bundle
               BASENAME=$(basename "$TARGET")
               FOUND=$(find "$BUNDLE_ROOT" -name "$BASENAME" | head -n 1)
               if [ -n "$FOUND" ]; then
@@ -92,20 +81,32 @@ runs:
           done
         }
 
-        # Répare les symlinks dans le root
         fix_symlinks "$BUNDLE_ROOT"
-
-        # Répare les symlinks dans tous les sous-bundles et apps imbriqués
         find "$BUNDLE_ROOT" -type d \( -name "*.bundle" -o -name "*.app" \) | while read SUBDIR; do
           fix_symlinks "$SUBDIR"
         done
 
-        echo "✅ Tous les symlinks valides ou réparés."
+        ##############################
+        # 2️⃣ Correction spécifique 4D Helper (Plugin)
+        ##############################
+        PLUGIN_APP="$BUNDLE_ROOT/4D Helper (Plugin).app"
+        TARGET_FRAMEWORK="$PLUGIN_APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+        SOURCE_FRAMEWORK="$BUNDLE_ROOT/Chromium Embedded Framework.framework"
 
-    - name: codesign
-      id: codesign
-      shell: bash
-      run: |
+        if [ -L "$TARGET_FRAMEWORK" ] || [ ! -d "$TARGET_FRAMEWORK" ]; then
+          echo "🔧 Correction du framework dans 4D Helper (Plugin)"
+          rm -rf "$TARGET_FRAMEWORK"
+          cp -R "$SOURCE_FRAMEWORK" "$PLUGIN_APP/Contents/Frameworks/"
+          echo "✔ Framework copié correctement."
+        else
+          echo "ℹ️ Framework déjà valide."
+        fi
+
+        echo "✅ Tous les symlinks valides et 4D Helper (Plugin) corrigé."
+
+        ##############################
+        # 3️⃣ Codesign complet
+        ##############################
         retry_codesign() {
           local target="$1"
           local attempt=1
