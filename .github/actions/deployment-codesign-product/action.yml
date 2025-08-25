@@ -47,70 +47,73 @@ runs:
         path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
-    - name: Fix WebViewerCEF.bundle & 4D Helper (Plugin) symlinks (robust)
+    - name: Fix WebViewerCEF.bundle & 4D Helper (Plugin) symlinks
       shell: bash
       run: |
         set -e
 
-        # Trouver le dossier WebViewerCEF.bundle/Contents/Frameworks
+        echo "🔍 Recherche du dossier WebViewerCEF.bundle..."
         BUNDLE_ROOT=$(find "$GITHUB_WORKSPACE" -type d -path "*WebViewerCEF.bundle/Contents/Frameworks" | head -n 1)
         if [ -z "$BUNDLE_ROOT" ]; then
           echo "❌ Impossible de trouver WebViewerCEF.bundle/Contents/Frameworks"
           exit 1
         fi
-        echo "🔍 Réparation des symlinks dans $BUNDLE_ROOT ..."
+        echo "✅ Trouvé : $BUNDLE_ROOT"
 
-        # Fonction pour réparer les symlinks cassés
+        # Fonction pour réparer les symlinks cassés dans un dossier
         fix_symlinks() {
           local DIR="$1"
           find "$DIR" -type l | while IFS= read -r SYMLINK; do
             TARGET=$(readlink "$SYMLINK")
             if [ ! -e "$(dirname "$SYMLINK")/$TARGET" ]; then
-              echo "⚠ Symlink cassé: $SYMLINK -> $TARGET"
+              echo "⚠ Symlink cassé : $SYMLINK -> $TARGET"
               rm "$SYMLINK"
               BASENAME=$(basename "$TARGET")
               FOUND=$(find "$BUNDLE_ROOT" -name "$BASENAME" | head -n 1)
               if [ -n "$FOUND" ]; then
-                echo "📦 Remplacement par copie réelle: $FOUND"
+                echo "📦 Remplacement par copie réelle : $FOUND"
                 cp -R "$FOUND" "$(dirname "$SYMLINK")/"
               else
-                echo "❌ Impossible de réparer: cible inexistante"
+                echo "❌ Impossible de réparer : cible inexistante"
               fi
             fi
           done
         }
 
-        # Réparer les symlinks dans le root et tous les bundles/apps imbriqués
+        # Réparer les symlinks dans WebViewerCEF.bundle et tous les bundles/app imbriqués
         fix_symlinks "$BUNDLE_ROOT"
         find "$BUNDLE_ROOT" -type d \( -name "*.bundle" -o -name "*.app" \) | while IFS= read -r SUBDIR; do
           fix_symlinks "$SUBDIR"
         done
 
-        # Corriger les symlinks relatifs de 4D Helper (Plugin)
-        find "$BUNDLE_ROOT" -type d -name "4D Helper (Plugin).app" | while IFS= read -r PLUGIN_PATH; do
-          FRAMEWORKS_DIR="$PLUGIN_PATH/Contents/Frameworks"
-          CEF_FRAMEWORK="$FRAMEWORKS_DIR/Chromium Embedded Framework.framework"
-          if [ ! -d "$CEF_FRAMEWORK" ]; then
-            echo "❌ Chromium Embedded Framework.framework absent dans $PLUGIN_PATH"
+        echo "🔍 Traitement des 4D Helper (Plugin).app..."
+        find "$BUNDLE_ROOT" -type d -path "*4D Helper (Plugin).app" | while IFS= read -r PLUGIN_APP; do
+          echo "✅ Correction de $PLUGIN_APP"
+
+          MACOS_DIR="$PLUGIN_APP/Contents/MacOS"
+          FRAMEWORKS_DIR="$PLUGIN_APP/Contents/Frameworks"
+          mkdir -p "$FRAMEWORKS_DIR"
+
+          # Supprime tous les symlinks invalides dans MacOS/
+          find "$MACOS_DIR" -type l | while IFS= read -r LINK; do
+            echo "⚠ Suppression du symlink invalide $LINK"
+            rm "$LINK"
+          done
+
+          # Copie réelle du framework Chromium Embedded Framework
+          SRC_CEF=$(find "$GITHUB_WORKSPACE" -type d -name "Chromium Embedded Framework.framework" | head -n 1)
+          if [ -z "$SRC_CEF" ]; then
+            echo "❌ Impossible de trouver Chromium Embedded Framework.framework"
             exit 1
           fi
 
-          echo "🔍 Correction des symlinks relatifs pour Chromium Embedded Framework dans $PLUGIN_PATH ..."
-          relative_path() {
-            python3 -c "import os,sys; print(os.path.relpath(sys.argv[2], start=sys.argv[1]))" "$1" "$2"
-          }
+          echo "📦 Copie du framework CEF dans $FRAMEWORKS_DIR"
+          cp -R "$SRC_CEF" "$FRAMEWORKS_DIR/"
 
-          find "$PLUGIN_PATH" -type l | while IFS= read -r LINK; do
-            TARGET=$(readlink "$LINK")
-            if [[ "$TARGET" == *"Chromium Embedded Framework.framework"* ]]; then
-              RELATIVE_TARGET=$(relative_path "$(dirname "$LINK")" "$CEF_FRAMEWORK")
-              echo "🔧 Correction du symlink $LINK -> $RELATIVE_TARGET"
-              ln -sf "$RELATIVE_TARGET" "$LINK"
-            fi
-          done
+          echo "✅ $PLUGIN_APP corrigé"
         done
 
-        echo "✅ Tous les symlinks valides ou réparés dans WebViewerCEF.bundle et ses apps imbriquées."
+        echo "🎉 Tous les symlinks de WebViewerCEF.bundle et 4D Helper (Plugin) sont corrigés."
 
     - name: Codesign
       shell: bash
