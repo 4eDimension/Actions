@@ -47,19 +47,19 @@ runs:
         path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
-    - name: codesign
+    - name: Fix WebViewerCEF.bundle symlinks (robust)
       shell: bash
       run: |
         set -e
 
-        ##############################
-        # 1️⃣ Fix des symlinks cassés
-        ##############################
+        # Trouve le dossier WebViewerCEF.bundle/Contents/Frameworks
         BUNDLE_ROOT=$(find "$GITHUB_WORKSPACE" -type d -path "*WebViewerCEF.bundle/Contents/Frameworks" | head -n 1)
+
         if [ -z "$BUNDLE_ROOT" ]; then
           echo "❌ Impossible de trouver le dossier WebViewerCEF.bundle/Contents/Frameworks"
           exit 1
         fi
+
         echo "🔍 Vérification et réparation des symlinks dans $BUNDLE_ROOT ..."
 
         fix_symlinks() {
@@ -81,32 +81,53 @@ runs:
           done
         }
 
+        # Répare les symlinks dans le root et dans tous les bundles/app imbriqués
         fix_symlinks "$BUNDLE_ROOT"
         find "$BUNDLE_ROOT" -type d \( -name "*.bundle" -o -name "*.app" \) | while read SUBDIR; do
           fix_symlinks "$SUBDIR"
         done
 
-        ##############################
-        # 2️⃣ Correction spécifique 4D Helper (Plugin)
-        ##############################
-        PLUGIN_APP="$BUNDLE_ROOT/4D Helper (Plugin).app"
-        TARGET_FRAMEWORK="$PLUGIN_APP/Contents/Frameworks/Chromium Embedded Framework.framework"
-        SOURCE_FRAMEWORK="$BUNDLE_ROOT/Chromium Embedded Framework.framework"
+        echo "✅ Tous les symlinks valides ou réparés."
 
-        if [ -L "$TARGET_FRAMEWORK" ] || [ ! -d "$TARGET_FRAMEWORK" ]; then
-          echo "🔧 Correction du framework dans 4D Helper (Plugin)"
-          rm -rf "$TARGET_FRAMEWORK"
-          cp -R "$SOURCE_FRAMEWORK" "$PLUGIN_APP/Contents/Frameworks/"
-          echo "✔ Framework copié correctement."
-        else
-          echo "ℹ️ Framework déjà valide."
-        fi
+    - name: Fix 4D Helper (Plugin) framework for codesign
+      shell: bash
+      run: |
+        set -e
 
-        echo "✅ Tous les symlinks valides et 4D Helper (Plugin) corrigé."
+        BUNDLE_PLUGIN="$GITHUB_WORKSPACE/AutoTestExec/AutoTestExec/Build/Client/AutoTestExec Client.app/Contents/Native Components/WebViewerCEF.bundle/Contents/Frameworks/4D Helper (Plugin).app"
+        FRAMEWORK_SRC="$GITHUB_WORKSPACE/AutoTestExec/AutoTestExec/Build/Client/AutoTestExec Client.app/Contents/Native Components/WebViewerCEF.bundle/Contents/Frameworks/Chromium Embedded Framework.framework"
+        FRAMEWORK_DST="$BUNDLE_PLUGIN/Contents/Frameworks/Chromium Embedded Framework.framework"
 
-        ##############################
-        # 3️⃣ Codesign complet
-        ##############################
+        echo "🔧 Suppression de tout framework existant dans 4D Helper (Plugin)..."
+        rm -rf "$FRAMEWORK_DST"
+
+        echo "📦 Copie du framework dans 4D Helper (Plugin)..."
+        cp -R "$FRAMEWORK_SRC" "$FRAMEWORK_DST"
+
+        echo "🔄 Correction des symlinks internes du framework..."
+        cd "$FRAMEWORK_DST"
+        find . -type l | while read L; do
+          TARGET=$(readlink "$L")
+          if [[ "$TARGET" = /* ]]; then
+            echo "🔧 Symlink absolu trouvé : $L -> $TARGET"
+            rm "$L"
+            BASENAME=$(basename "$TARGET")
+            if [ -e "./$BASENAME" ]; then
+              ln -s "$BASENAME" "$L"
+              echo "✔ Symlink corrigé : $L -> $BASENAME"
+            else
+              echo "❌ Impossible de corriger : $L -> $TARGET"
+            fi
+          fi
+        done
+
+        echo "✅ 4D Helper (Plugin) prêt pour codesign."
+
+    - name: Codesign
+      shell: bash
+      run: |
+        set -e
+
         retry_codesign() {
           local target="$1"
           local attempt=1
@@ -116,8 +137,8 @@ runs:
           while [ $attempt -le $max_attempts ]; do
             echo "[$attempt/$max_attempts] codesign de: $target"
 
-            output=$(codesign --verbose --deep --strict --options=runtime --timestamp --force \
-              --sign "${sign}" --keychain "${keychain}" \
+            output=$(codesign --verbose --deep --strict --options=runtime --timestamp \
+              --force --sign "${sign}" --keychain "${keychain}" \
               --entitlements "${entitlements_path}" "$target" 2>&1)
             status=$?
             echo "$output"
@@ -144,7 +165,7 @@ runs:
 
         IFS=$'\n'; set -f
 
-        echo "=== Étape 1 : signer tous les binaires externes (hors .4dbase/.4darchive) ==="
+        echo "=== Étape 1 : signer tous les binaires externes ==="
         find "${product_path}" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
           ! -path "*.4dbase/*" ! -path "*.4darchive/*" \
           | while read f; do
@@ -163,7 +184,7 @@ runs:
               retry_codesign "$f" || exit 1
             done
 
-        echo "=== Étape 4 : signer le contenu des .4dbase et .4darchive ==="
+        echo "=== Étape 4 : signer les .4dbase et .4darchive ==="
         find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) \
           | while read bundle; do
               echo "📂 Signing binaries inside: $bundle"
@@ -179,7 +200,7 @@ runs:
               retry_codesign "$f" || exit 1
             done
 
-        echo "=== Étape 6 : signature finale du paquet racine si applicable ==="
+        echo "=== Étape 6 : signature finale du paquet racine ==="
         if [[ "${product_path}" == *.app ]]; then
           echo "📦 Signature finale de l’app principale : ${product_path}"
           retry_codesign "${product_path}" || exit 1
