@@ -88,35 +88,30 @@ runs:
 
         IFS=$'\n'; set -f
 
-        echo "=== Étape 1 : signer tous les binaires externes (hors .4dbase et .4darchive) ==="
+        echo "=== Étape 1 : signer tous les binaires externes (hors .4dbase/.4darchive) ==="
         find "${product_path}" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
           ! -path "*.4dbase/*" ! -path "*.4darchive/*" \
-          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
           | while read f; do
               retry_codesign "$f" || exit 1
             done
 
         echo "=== Étape 2 : signer les frameworks ==="
         find "${product_path}" -type d -name "*.framework" \
-          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
           | while read f; do
               retry_codesign "$f" || exit 1
             done
 
         echo "=== Étape 3 : signer les bundles/plugins/kexts ==="
         find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) \
-          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
           | while read f; do
               retry_codesign "$f" || exit 1
             done
 
         echo "=== Étape 4 : signer le contenu des .4dbase et .4darchive ==="
         find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) \
-          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
-          | while read archive; do
-              echo "📂 Signing binaries inside: $archive"
-              find "$archive" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
-                | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
+          | while read bundle; do
+              echo "📂 Signing binaries inside: $bundle"
+              find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
                 | while read f; do
                     retry_codesign "$f" || exit 1
                   done
@@ -124,7 +119,6 @@ runs:
 
         echo "=== Étape 5 : signer toutes les apps internes ==="
         find "${product_path}" -type d -name "*.app" \
-          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
           | while read f; do
               retry_codesign "$f" || exit 1
             done
@@ -134,17 +128,16 @@ runs:
           echo "📦 Signature finale de l’app principale : ${product_path}"
           retry_codesign "${product_path}" || exit 1
         else
-          echo "ℹ️ ${product_path} n’est pas une .app (ex: .4dbase/.4darchive), pas de signature racine."
+          echo "ℹ️ ${product_path} n’est pas une .app/.4dbase/.4darchive, pas de signature racine."
         fi
 
-        echo "=== Étape 7 : vérification stricte ==="
-        if [[ "${product_path}" == *.app ]] || [[ "${product_path}" == *.4dbase ]] || [[ "${product_path}" == *.4darchive ]]; then
-          codesign --verify --deep --strict --verbose=2 "${product_path}" || echo "⚠️ Vérification codesign échouée (peut être normal pour certains fichiers internes)."
-        else
-          echo "ℹ️ Vérification codesign sautée (type de fichier non pris en charge)."
-        fi
+        echo "=== Étape 7 : vérification stricte sur tous les binaires signés ==="
+        find "${product_path}" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
+          | while read f; do
+              codesign --verify --strict --verbose=2 "$f" || exit 1
+            done
 
-        echo "✅ Tous les composants ont été signés correctement."
+        echo "✅ Tous les composants ont été signés et vérifiés correctement."
       env:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
