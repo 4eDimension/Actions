@@ -89,13 +89,56 @@ runs:
 
         echo "✅ Tous les symlinks valides ou réparés."
 
-    - name: Fix 4D Helper (Plugin) framework for codesign
+    - name: Fix 4D Helper (Plugin) symlinks & frameworks
       shell: bash
       run: |
         set -e
 
-        BUNDLE_PLUGIN="$GITHUB_WORKSPACE/AutoTestExec/AutoTestExec/Build/Client/AutoTestExec Client.app/Contents/Native Components/WebViewerCEF.bundle/Contents/Frameworks/4D Helper (Plugin).app"
-        FRAMEWORK_SRC="$GITHUB_WORKSPACE/AutoTestExec/AutoTestExec/Build/Client/AutoTestExec Client.app/Contents/Native Components/WebViewerCEF.bundle/Contents/Frameworks/Chromium Embedded Framework.framework"
+        echo "🔍 Recherche du dossier WebViewerCEF.bundle..."
+        WEBVIEWER_ROOT=$(find "$GITHUB_WORKSPACE" -type d -path "*WebViewerCEF.bundle/Contents/Frameworks" | head -n 1)
+
+        if [ -z "$WEBVIEWER_ROOT" ]; then
+          echo "❌ Impossible de trouver WebViewerCEF.bundle/Contents/Frameworks"
+          exit 1
+        fi
+
+        echo "🔍 Vérification et réparation des symlinks dans $WEBVIEWER_ROOT..."
+
+        fix_symlinks() {
+          local DIR="$1"
+          find "$DIR" -type l | while read SYMLINK; do
+            TARGET=$(readlink "$SYMLINK")
+            if [ ! -e "$(dirname "$SYMLINK")/$TARGET" ]; then
+              echo "⚠ Symlink cassé: $SYMLINK -> $TARGET"
+              rm "$SYMLINK"
+              BASENAME=$(basename "$TARGET")
+              FOUND=$(find "$WEBVIEWER_ROOT" -name "$BASENAME" | head -n 1)
+              if [ -n "$FOUND" ]; then
+                echo "📦 Remplacement par copie réelle: $FOUND"
+                cp -R "$FOUND" "$(dirname "$SYMLINK")/"
+              else
+                echo "❌ Impossible de réparer: cible inexistante"
+              fi
+            fi
+          done
+        }
+
+        # Répare les symlinks dans le root et tous les sous-bundles
+        fix_symlinks "$WEBVIEWER_ROOT"
+        find "$WEBVIEWER_ROOT" -type d \( -name "*.bundle" -o -name "*.app" \) | while read SUBDIR; do
+          fix_symlinks "$SUBDIR"
+        done
+        echo "✅ Tous les symlinks valides ou réparés."
+
+        echo "🔍 Recherche du framework Chromium Embedded Framework..."
+        FRAMEWORK_SRC=$(find "$WEBVIEWER_ROOT" -name "Chromium Embedded Framework.framework" | head -n 1)
+
+        if [ -z "$FRAMEWORK_SRC" ]; then
+          echo "❌ Impossible de trouver Chromium Embedded Framework.framework"
+          exit 1
+        fi
+
+        BUNDLE_PLUGIN="$WEBVIEWER_ROOT/4D Helper (Plugin).app"
         FRAMEWORK_DST="$BUNDLE_PLUGIN/Contents/Frameworks/Chromium Embedded Framework.framework"
 
         echo "🔧 Suppression de tout framework existant dans 4D Helper (Plugin)..."
@@ -104,24 +147,7 @@ runs:
         echo "📦 Copie du framework dans 4D Helper (Plugin)..."
         cp -R "$FRAMEWORK_SRC" "$FRAMEWORK_DST"
 
-        echo "🔄 Correction des symlinks internes du framework..."
-        cd "$FRAMEWORK_DST"
-        find . -type l | while read L; do
-          TARGET=$(readlink "$L")
-          if [[ "$TARGET" = /* ]]; then
-            echo "🔧 Symlink absolu trouvé : $L -> $TARGET"
-            rm "$L"
-            BASENAME=$(basename "$TARGET")
-            if [ -e "./$BASENAME" ]; then
-              ln -s "$BASENAME" "$L"
-              echo "✔ Symlink corrigé : $L -> $BASENAME"
-            else
-              echo "❌ Impossible de corriger : $L -> $TARGET"
-            fi
-          fi
-        done
-
-        echo "✅ 4D Helper (Plugin) prêt pour codesign."
+        echo "✅ Framework copié avec succès dans 4D Helper (Plugin)."
 
     - name: Codesign
       shell: bash
