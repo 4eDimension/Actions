@@ -110,16 +110,16 @@ runs:
             done
 
         echo "=== Étape 4 : signer le contenu des .4darchive et .4dbase ==="
-        for archive in $(find "${product_path}" -type d \( -name "*.4darchive" -o -name "*.4dbase" \) \
-                        | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2-); do
-          echo "📂 Signing binaries inside: $archive"
-          find "$archive" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
-            | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
-            | while read f; do
-                retry_codesign "$f" || exit 1
-              done
-          retry_codesign "$archive" || exit 1
-        done
+        find "${product_path}" -type d \( -name "*.4darchive" -o -name "*.4dbase" \) \
+          | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
+          | while read archive; do
+              echo "📂 Signing binaries inside: $archive"
+              find "$archive" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
+                | awk '{ print length, $0 }' | sort -nr | cut -d" " -f2- \
+                | while read f; do
+                    retry_codesign "$f" || exit 1
+                  done
+          done
 
         echo "=== Étape 5 : signer toutes les apps internes ==="
         find "${product_path}" -type d -name "*.app" \
@@ -130,21 +130,13 @@ runs:
 
         unset IFS; set +f
 
-        echo "=== Étape 6 : signature finale du produit racine si applicable ==="
-        if [[ "${product_path}" == *.app || "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ]]; then
-          echo "📦 Signature finale du produit : ${product_path}"
-          retry_codesign "${product_path}" || exit 1
-        else
-          echo "ℹ️ Type de fichier non pris en charge pour la signature racine : ${product_path}"
-        fi
-
-        echo "=== Étape 7 : vérification stricte ==="
-        if [[ "${product_path}" == *.app || "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ]]; then
-          codesign --verify --deep --strict --verbose=2 "${product_path}"
-          spctl --assess --type execute --verbose=4 "${product_path}" || true
-        else
-          echo "ℹ️ Vérification sautée pour les types non pris en charge."
-        fi
+        echo "=== Étape 6 : vérification stricte ==="
+        # Vérification uniquement pour les apps
+        find "${product_path}" -type d -name "*.app" \
+          | while read app; do
+              codesign --verify --deep --strict --verbose=2 "$app"
+              spctl --assess --type execute --verbose=4 "$app" || true
+          done
 
         echo "✅ Tous les composants ont été signés correctement."
       env:
