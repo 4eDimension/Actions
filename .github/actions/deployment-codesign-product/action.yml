@@ -54,15 +54,14 @@ runs:
         shopt -s nullglob
 
         echo "🔎 Scan des répertoires *WebViewerCEF.bundle/Contents/Frameworks* dans ${GITHUB_WORKSPACE}"
-        mapfile -d '' BUNDLES < <(find "${GITHUB_WORKSPACE}" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
-        if [ ${#BUNDLES[@]} -eq 0 ]; then
-          echo "❌ Aucun WebViewerCEF.bundle trouvé"; exit 1
-        fi
+        FOUND=0
 
         # petit helper Python pour résoudre proprement la cible d'un lien relatif
         py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
 
-        for BUNDLE_ROOT in "${BUNDLES[@]}"; do
+        find "${GITHUB_WORKSPACE}" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0 | \
+        while IFS= read -r -d '' BUNDLE_ROOT; do
+          FOUND=1
           echo "📦 Bundle: $BUNDLE_ROOT"
 
           # CEF source à la racine du bundle WebViewerCEF
@@ -72,6 +71,7 @@ runs:
           fi
 
           # Traiter tous les helpers
+          find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0 | \
           while IFS= read -r -d '' APP; do
             NAME="$(basename "$APP" .app)"
             MACOS_DIR="$APP/Contents/MacOS"
@@ -99,26 +99,41 @@ runs:
                 /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
               fi
             fi
-          done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
+          done
 
           echo "🔎 Sanity check (ls des exécutables des helpers)"
+          find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0 | \
           while IFS= read -r -d '' APP; do
             N="$(basename "$APP" .app)"
             E="$APP/Contents/MacOS/$N"
             ls -l "$E" || true
-          done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
+          done
         done
+
+        if [ $FOUND -eq 0 ]; then
+          echo "❌ Aucun WebViewerCEF.bundle trouvé"; exit 1
+        fi
+
 
     - name: Preflight — aucun exécutable de helper ne doit être un symlink
       shell: bash
       run: |
         set -euo pipefail
-        mapfile -d '' SYMEXE < <(find "${GITHUB_WORKSPACE}" -type l -path "*/4D Helper*.app/Contents/MacOS/*" -print0 || true)
-        if [ ${#SYMEXE[@]} -gt 0 ]; then
-          echo "❌ Symlinks d'exécutables trouvés :" 
-          printf ' - %s\n' "${SYMEXE[@]}"
+        SYMLINKS_FOUND=0
+
+        find "${GITHUB_WORKSPACE}" -type l -path "*/4D Helper*.app/Contents/MacOS/*" -print0 | \
+        while IFS= read -r -d '' SYM; do
+          if [ $SYMLINKS_FOUND -eq 0 ]; then
+            echo "❌ Symlinks d'exécutables trouvés :"
+          fi
+          echo " - $SYM"
+          SYMLINKS_FOUND=1
+        done
+
+        if [ $SYMLINKS_FOUND -eq 1 ]; then
           exit 1
         fi
+
         echo "✅ OK — aucun symlink executable dans les helpers"
 
     - name: Codesign
