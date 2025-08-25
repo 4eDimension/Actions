@@ -55,7 +55,7 @@ runs:
 
         echo "🔎 Scan des répertoires *WebViewerCEF.bundle/Contents/Frameworks* dans ${GITHUB_WORKSPACE}"
 
-        # petit helper Python pour résoudre proprement la cible d'un lien relatif
+        # helper Python pour résoudre la cible d'un symlink relatif
         py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
 
         FOUND=0
@@ -68,11 +68,12 @@ runs:
             echo "❌ CEF introuvable dans $BUNDLE_ROOT"; exit 1
           fi
 
+          # Traiter tous les helpers
           while IFS= read -r -d '' APP; do
             NAME="$(basename "$APP" .app)"
             EXE="$APP/Contents/MacOS/$NAME"
 
-            # 1) L'exécutable ne doit pas être un symlink
+            # 1) L'exécutable principal ne doit pas être un symlink
             if [ -L "$EXE" ]; then
               TGT="$(readlink "$EXE")"
               RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
@@ -85,17 +86,20 @@ runs:
               chmod 755 "$EXE"
             fi
 
-            # 2) Pour le helper (Plugin), s'assurer d'une COPIE LOCALE du CEF
-            if [[ "$NAME" == "4D Helper (Plugin)" ]]; then
-              DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
-              if [ -L "$DEST_CEF" ] || [ ! -d "$DEST_CEF" ]; then
-                echo "📚 Installe CEF local dans: $DEST_CEF"
-                rm -rf "$DEST_CEF"
-                /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
-              fi
+            # 2) Tous les helpers doivent avoir une copie locale du framework CEF
+            DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+            if [ -L "$DEST_CEF" ]; then
+              echo "🪄 Supprime symlink CEF dans $APP"
+              rm -f "$DEST_CEF"
             fi
+            if [ ! -d "$DEST_CEF" ]; then
+              echo "📚 Copie CEF local dans: $DEST_CEF"
+              /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
+            fi
+
           done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
 
+          # Sanity check : executables des helpers
           echo "🔎 Sanity check (ls des exécutables des helpers)"
           while IFS= read -r -d '' APP; do
             N="$(basename "$APP" .app)"
