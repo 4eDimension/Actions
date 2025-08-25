@@ -89,34 +89,36 @@ runs:
 
         echo "✅ Tous les symlinks valides ou réparés."
 
-    - name: Copy Chromium Embedded Framework into 4D Helper (Plugin)
+    - name: Fix 4D Helper (Plugin) symlinks
       shell: bash
       run: |
         set -e
 
-        # Trouver le WebViewerCEF.bundle root
-        WEBVIEWER_ROOT=$(find "$GITHUB_WORKSPACE" -type d -path "*WebViewerCEF.bundle/Contents/Frameworks" | head -n 1)
-        if [ -z "$WEBVIEWER_ROOT" ]; then
-          echo "❌ Impossible de trouver le dossier WebViewerCEF.bundle/Contents/Frameworks"
+        PLUGIN_PATH=$(find "$GITHUB_WORKSPACE" -type d -path "*4D Helper (Plugin).app" | head -n 1)
+        if [ -z "$PLUGIN_PATH" ]; then
+          echo "❌ Impossible de trouver 4D Helper (Plugin).app"
           exit 1
         fi
 
-        # Définir le plugin target
-        PLUGIN_DIR="$WEBVIEWER_ROOT/4D Helper (Plugin).app/Contents/Frameworks"
+        FRAMEWORKS_DIR="$PLUGIN_PATH/Contents/Frameworks"
+        CEF_FRAMEWORK="$FRAMEWORKS_DIR/Chromium Embedded Framework.framework"
 
-        # Créer le dossier Frameworks si absent
-        mkdir -p "$PLUGIN_DIR"
-
-        # Chercher le vrai Chromium Embedded Framework
-        CEF_FRAMEWORK=$(find "$WEBVIEWER_ROOT" -name "Chromium Embedded Framework.framework" | head -n 1)
-        if [ -z "$CEF_FRAMEWORK" ]; then
-          echo "❌ Impossible de trouver Chromium Embedded Framework.framework"
+        if [ ! -d "$CEF_FRAMEWORK" ]; then
+          echo "❌ Chromium Embedded Framework.framework absent dans le plugin"
           exit 1
         fi
 
-        echo "📦 Copie de CEF dans 4D Helper (Plugin)..."
-        cp -R "$CEF_FRAMEWORK" "$PLUGIN_DIR/"
-        echo "✅ Copie terminée."
+        # Chercher les symlinks invalides pointant vers CEF et les réparer
+        find "$PLUGIN_PATH" -type l | while read LINK; do
+          TARGET=$(readlink "$LINK")
+          if [[ "$TARGET" == *"Chromium Embedded Framework.framework"* ]]; then
+            RELATIVE_TARGET=$(realpath --relative-to="$(dirname "$LINK")" "$CEF_FRAMEWORK")
+            echo "🔧 Correction du symlink $LINK -> $RELATIVE_TARGET"
+            ln -sf "$RELATIVE_TARGET" "$LINK"
+          fi
+        done
+
+        echo "✅ Symlinks corrigés dans 4D Helper (Plugin)."
 
     - name: Codesign
       shell: bash
