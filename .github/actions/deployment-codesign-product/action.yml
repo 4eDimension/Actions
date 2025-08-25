@@ -47,7 +47,7 @@ runs:
         path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
-    - name: Fix all invalid symlinks in WebViewerCEF.bundle (Robust)
+    - name: Fix all invalid symlinks in WebViewerCEF.bundle
       shell: bash
       run: |
         set -e
@@ -67,11 +67,19 @@ runs:
           local DIR="$1"
           find "$DIR" -type l | while read SYMLINK; do
             TARGET=$(readlink "$SYMLINK")
-            # Vérifie si la cible existe par rapport au symlink
             if [ ! -e "$(dirname "$SYMLINK")/$TARGET" ]; then
               echo "⚠ Symlink cassé: $SYMLINK -> $TARGET"
               rm "$SYMLINK"
-              # Essayons de copier la cible si elle existe quelque part dans le bundle
+
+              # Cas particulier pour 4D Helper (Plugin)
+              if [[ "$SYMLINK" == *"4D Helper (Plugin).app/Contents/Frameworks/Chromium Embedded Framework.framework" ]]; then
+                echo "🔧 Correction du symlink spécifique pour 4D Helper (Plugin)"
+                ln -s ../../Chromium\ Embedded\ Framework.framework "$(dirname "$SYMLINK")/"
+                echo "✔ Symlink réparé."
+                continue
+              fi
+
+              # Sinon essaye de copier la cible si elle existe quelque part dans le bundle
               BASENAME=$(basename "$TARGET")
               FOUND=$(find "$BUNDLE_ROOT" -name "$BASENAME" | head -n 1)
               if [ -n "$FOUND" ]; then
@@ -93,7 +101,7 @@ runs:
         done
 
         echo "✅ Tous les symlinks valides ou réparés."
-  
+
     - name: codesign
       id: codesign
       shell: bash
