@@ -89,65 +89,34 @@ runs:
 
         echo "✅ Tous les symlinks valides ou réparés."
 
-    - name: Fix 4D Helper (Plugin) symlinks & frameworks
+    - name: Copy Chromium Embedded Framework into 4D Helper (Plugin)
       shell: bash
       run: |
         set -e
 
-        echo "🔍 Recherche du dossier WebViewerCEF.bundle..."
+        # Trouver le WebViewerCEF.bundle root
         WEBVIEWER_ROOT=$(find "$GITHUB_WORKSPACE" -type d -path "*WebViewerCEF.bundle/Contents/Frameworks" | head -n 1)
-
         if [ -z "$WEBVIEWER_ROOT" ]; then
-          echo "❌ Impossible de trouver WebViewerCEF.bundle/Contents/Frameworks"
+          echo "❌ Impossible de trouver le dossier WebViewerCEF.bundle/Contents/Frameworks"
           exit 1
         fi
 
-        echo "🔍 Vérification et réparation des symlinks dans $WEBVIEWER_ROOT..."
+        # Définir le plugin target
+        PLUGIN_DIR="$WEBVIEWER_ROOT/4D Helper (Plugin).app/Contents/Frameworks"
 
-        fix_symlinks() {
-          local DIR="$1"
-          find "$DIR" -type l | while read SYMLINK; do
-            TARGET=$(readlink "$SYMLINK")
-            if [ ! -e "$(dirname "$SYMLINK")/$TARGET" ]; then
-              echo "⚠ Symlink cassé: $SYMLINK -> $TARGET"
-              rm "$SYMLINK"
-              BASENAME=$(basename "$TARGET")
-              FOUND=$(find "$WEBVIEWER_ROOT" -name "$BASENAME" | head -n 1)
-              if [ -n "$FOUND" ]; then
-                echo "📦 Remplacement par copie réelle: $FOUND"
-                cp -R "$FOUND" "$(dirname "$SYMLINK")/"
-              else
-                echo "❌ Impossible de réparer: cible inexistante"
-              fi
-            fi
-          done
-        }
+        # Créer le dossier Frameworks si absent
+        mkdir -p "$PLUGIN_DIR"
 
-        # Répare les symlinks dans le root et tous les sous-bundles
-        fix_symlinks "$WEBVIEWER_ROOT"
-        find "$WEBVIEWER_ROOT" -type d \( -name "*.bundle" -o -name "*.app" \) | while read SUBDIR; do
-          fix_symlinks "$SUBDIR"
-        done
-        echo "✅ Tous les symlinks valides ou réparés."
-
-        echo "🔍 Recherche du framework Chromium Embedded Framework..."
-        FRAMEWORK_SRC=$(find "$WEBVIEWER_ROOT" -name "Chromium Embedded Framework.framework" | head -n 1)
-
-        if [ -z "$FRAMEWORK_SRC" ]; then
+        # Chercher le vrai Chromium Embedded Framework
+        CEF_FRAMEWORK=$(find "$WEBVIEWER_ROOT" -name "Chromium Embedded Framework.framework" | head -n 1)
+        if [ -z "$CEF_FRAMEWORK" ]; then
           echo "❌ Impossible de trouver Chromium Embedded Framework.framework"
           exit 1
         fi
 
-        BUNDLE_PLUGIN="$WEBVIEWER_ROOT/4D Helper (Plugin).app"
-        FRAMEWORK_DST="$BUNDLE_PLUGIN/Contents/Frameworks/Chromium Embedded Framework.framework"
-
-        echo "🔧 Suppression de tout framework existant dans 4D Helper (Plugin)..."
-        rm -rf "$FRAMEWORK_DST"
-
-        echo "📦 Copie du framework dans 4D Helper (Plugin)..."
-        cp -R "$FRAMEWORK_SRC" "$FRAMEWORK_DST"
-
-        echo "✅ Framework copié avec succès dans 4D Helper (Plugin)."
+        echo "📦 Copie de CEF dans 4D Helper (Plugin)..."
+        cp -R "$CEF_FRAMEWORK" "$PLUGIN_DIR/"
+        echo "✅ Copie terminée."
 
     - name: Codesign
       shell: bash
