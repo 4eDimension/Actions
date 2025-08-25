@@ -108,11 +108,15 @@ runs:
           exit 1
         fi
 
-        # Chercher les symlinks invalides pointant vers CEF et les réparer
+        # Fonction pour calculer le chemin relatif sur macOS
+        relative_path() {
+          python3 -c "import os,sys; print(os.path.relpath(sys.argv[2], start=sys.argv[1]))" "$1" "$2"
+        }
+
         find "$PLUGIN_PATH" -type l | while read LINK; do
           TARGET=$(readlink "$LINK")
           if [[ "$TARGET" == *"Chromium Embedded Framework.framework"* ]]; then
-            RELATIVE_TARGET=$(realpath --relative-to="$(dirname "$LINK")" "$CEF_FRAMEWORK")
+            RELATIVE_TARGET=$(relative_path "$(dirname "$LINK")" "$CEF_FRAMEWORK")
             echo "🔧 Correction du symlink $LINK -> $RELATIVE_TARGET"
             ln -sf "$RELATIVE_TARGET" "$LINK"
           fi
