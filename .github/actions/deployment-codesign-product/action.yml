@@ -88,53 +88,43 @@ runs:
 
         IFS=$'\n'; set -f
 
-        sign_all_parallel() {
+        sign_all_binaries() {
           local root="$1"
-          echo "=== Signature parallèle des fichiers dans $root ==="
-
-          # Signer tous les fichiers exécutables, dylibs et .so en parallèle
-          find "$root" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
-            | xargs -n 1 -P 4 -I {} bash -c 'retry_codesign "$@"' _ {}
-
-          # Signer les frameworks
-          find "$root" -type d -name "*.framework" \
-            | xargs -n 1 -P 4 -I {} bash -c 'retry_codesign "$@"' _ {}
-
-          # Signer bundles/plugins/kexts
-          find "$root" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) \
-            | xargs -n 1 -P 4 -I {} bash -c 'retry_codesign "$@"' _ {}
-
-          # Signer apps internes
-          find "$root" -type d -name "*.app" \
-            | xargs -n 1 -P 4 -I {} bash -c 'retry_codesign "$@"' _ {}
+          find "$root" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) | while read f; do
+            retry_codesign "$f" || exit 1
+          done
+          find "$root" -type d \( -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) | while read d; do
+            retry_codesign "$d" || exit 1
+          done
+          find "$root" -type d -name "*.app" | while read app; do
+            retry_codesign "$app" || exit 1
+          done
         }
 
-        process_item() {
-          local path="$1"
-          if [[ "$path" == *.4darchive ]]; then
-            echo "📦 Traitement d'une archive .4darchive"
-            TMP_DIR="${RUNNER_TEMP}/4darchive_extract"
-            rm -rf "$TMP_DIR"
-            mkdir -p "$TMP_DIR"
-            ditto -x -k "$path" "$TMP_DIR"
-            sign_all_parallel "$TMP_DIR"
-            retry_codesign "$TMP_DIR"
-            ditto -c -k --sequesterRsrc --keepParent "$TMP_DIR" "$path"
-          elif [[ "$path" == *.4dbase ]]; then
-            echo "📂 Traitement d'une base 4D .4dbase"
-            sign_all_parallel "$path"
-            retry_codesign "$path"
-          elif [[ "$path" == *.app ]]; then
-            echo "📦 Traitement d'une application macOS .app"
-            sign_all_parallel "$path"
-            retry_codesign "$path"
-          else
-            echo "⚠️ Type de fichier non géré : $path"
-            exit 1
-          fi
+        process_4darchive() {
+          local archive="$1"
+          echo "📦 Traitement .4darchive : $archive"
+          TMP_DIR="${RUNNER_TEMP}/4darchive_extract_$(basename "$archive")"
+          rm -rf "$TMP_DIR"
+          mkdir -p "$TMP_DIR"
+          ditto -x -k "$archive" "$TMP_DIR"
+
+          # Signer tout le contenu de l'archive
+          sign_all_binaries "$TMP_DIR"
+
+          # Recréer l'archive après signature
+          ditto -c -k --sequesterRsrc --keepParent "$TMP_DIR" "$archive"
         }
 
-        process_item "${product_path}"
+        if [[ "${product_path}" == *.4darchive ]]; then
+          process_4darchive "${product_path}"
+        elif [[ "${product_path}" == *.4dbase || "${product_path}" == *.app ]]; then
+          sign_all_binaries "${product_path}"
+          retry_codesign "${product_path}"
+        else
+          echo "⚠️ Type de fichier non géré : ${product_path}"
+          exit 1
+        fi
 
         unset IFS; set +f
 
