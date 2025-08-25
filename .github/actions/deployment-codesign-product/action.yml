@@ -46,6 +46,36 @@ runs:
       env:
         path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
+
+    - name: Fix invalid symlinks in WebViewerCEF.bundle
+      shell: bash
+      run: |
+        BUNDLE_PATH="${GITHUB_WORKSPACE}/AutoTestExec/AutoTestExec/Build/Client/AutoTestExec Client.app/Contents/Native Components/WebViewerCEF.bundle/Contents/Frameworks/4D Helper (Plugin).app/Contents/Frameworks"
+
+        echo "🔍 Vérification des symlinks dans $BUNDLE_PATH"
+
+        # Parcours tous les symlinks
+        find "$BUNDLE_PATH" -type l | while read symlink; do
+          TARGET=$(readlink "$symlink")
+          
+          # Vérifie si la cible existe
+          if [ ! -e "$symlink/../$TARGET" ]; then
+            echo "⚠ Symlink cassé trouvé: $symlink -> $TARGET"
+            
+            # Supprime le symlink cassé
+            rm "$symlink"
+            
+            # Tente de copier le fichier réel à la place
+            if [ -e "$BUNDLE_PATH/$TARGET" ]; then
+              echo "📦 Remplacement par copie réelle"
+              cp -R "$BUNDLE_PATH/$TARGET" "$symlink"
+            else
+              echo "❌ Impossible de réparer: cible inexistante, vérifie ton bundle"
+              exit 1
+            fi
+          fi
+        done
+        echo "✅ Tous les symlinks valides ou réparés."
   
     - name: codesign
       id: codesign
