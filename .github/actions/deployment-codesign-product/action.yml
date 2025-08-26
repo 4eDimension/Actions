@@ -36,7 +36,7 @@ runs:
   using: "composite"
   steps:
 
-    - name: setup
+    - name: Setup
       id: setup
       run: |
         echo "dmg_path=${{ inputs.dmg_path }}" >> $GITHUB_OUTPUT
@@ -44,7 +44,6 @@ runs:
         echo "entitlements_path=${GITHUB_WORKSPACE}/entitlements.plist" >> $GITHUB_OUTPUT
       shell: bash
       env:
-        path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
     - name: Export codesign variables
@@ -53,17 +52,18 @@ runs:
         export sign="${{ inputs.sign }}"
         export keychain="${{ inputs.keychain }}"
         export entitlements_path="${{ steps.setup.outputs.entitlements_path }}"
+        export product_path="${{ inputs.product_path }}"
         echo "✅ Variables codesign exportées pour toutes les boucles"
 
     - name: Codesign
       shell: bash
-      env:
-        sign: ${{ inputs.sign }}
-        keychain: ${{ inputs.keychain }}
-        product_path: ${{ inputs.product_path }}
-        entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
       run: |
         set -euo pipefail
+
+        export sign="${{ inputs.sign }}"
+        export keychain="${{ inputs.keychain }}"
+        export entitlements_path="${{ steps.setup.outputs.entitlements_path }}"
+        export product_path="${{ inputs.product_path }}"
 
         retry_codesign() {
           local target="$1"
@@ -88,14 +88,14 @@ runs:
 
         export -f retry_codesign
 
-        # Signer fichiers et bundles
-        find "${product_path}" -type f -name "*.dylib" -print0 | xargs -0 -n1 -P4 bash -c 'retry_codesign "$0"'
-        find "${product_path}" -type d \( -name "*.app" -o -name "*.4darchive" \) -print0 | xargs -0 -n1 -P2 bash -c 'retry_codesign "$0"'
-        find "${product_path}" -type d \( -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0 | xargs -0 -n1 -P2 bash -c 'retry_codesign "$0"'
+        # Trouver tous les éléments à signer
+        find "${product_path}" -type d \( -name "*.app" -o -name "*.4dbase" -o -name "*.4darchive" \
+            -o -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0 \
+          | xargs -0 -n1 -P$(nproc) bash -c 'retry_codesign "$0"' 
 
-        # Signer la racine si .app
+        # Signer la racine si c'est une app
         if [[ "${product_path}" == *.app ]]; then
-          retry_codesign "$product_path" || exit 1
+          retry_codesign "$product_path"
         fi
 
         echo "✅ Tous les composants signés (batch) et vérifiés."
@@ -103,13 +103,10 @@ runs:
     - name: Create DMG
       id: hdiutil
       shell: bash
-      env:
-        product_path: ${{ inputs.product_path }}
-        dmg_path: ${{ steps.setup.outputs.dmg_path }}
       run: |
         set -euo pipefail
         SRC="${product_path}"
-        OUT="${dmg_path}"
+        OUT="${{ steps.setup.outputs.dmg_path }}"
         VOLNAME="$(basename "${OUT%.dmg}")"
         WORKDIR="$(mktemp -d /tmp/dmgbuild.XXXXXX)"
         MOUNT_DIR="${WORKDIR}/mnt"
@@ -127,10 +124,12 @@ runs:
         echo "[✓] DMG ready: $OUT"
 
     - name: Notarize with Apple NotaryTool
+      id: notarytool
       shell: bash
       run: |
+        set -euo pipefail
         echo "📦 Soumission à Apple NotaryTool..."
-        xcrun notarytool submit "${{ inputs.dmg_path }}" \
+        xcrun notarytool submit "${{ steps.setup.outputs.dmg_path }}" \
           --apple-id "${{ inputs.apple_id }}" \
           --team-id "${{ inputs.team_id }}" \
           --password "${{ inputs.password }}" \
@@ -141,9 +140,11 @@ runs:
         submission_id=$(jq -r '.id // empty' notarytool-output.json)
         echo "🛡️ Statut notarisation: $status"
 
+        # Export GitHub Actions output
+        echo "notarization_status=$status" >> $GITHUB_OUTPUT
+
         if [[ "$status" == "Accepted" ]]; then
           echo "✅ Notarisation réussie"
-          exit 0
         elif [[ "$status" == "Invalid" ]]; then
           echo "❌ Notarisation rejetée"
           xcrun notarytool log "$submission_id" \
