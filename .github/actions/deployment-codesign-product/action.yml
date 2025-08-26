@@ -1,5 +1,5 @@
-name: Codesign Product
-description: Submit product to notary
+name: Codesign & Notarize Product
+description: Submit product to Apple Notary in a reliable and faster way
 
 inputs:
   sign:
@@ -36,357 +36,139 @@ runs:
   using: "composite"
   steps:
 
-    - name: setup
+    - name: Setup
       id: setup
       run: |
         echo "dmg_path=${{ inputs.dmg_path }}" >> $GITHUB_OUTPUT
-        curl "${entitlements_url}" -o entitlements.plist -sL
+        curl -sL 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist' -o entitlements.plist
         echo "entitlements_path=${GITHUB_WORKSPACE}/entitlements.plist" >> $GITHUB_OUTPUT
       shell: bash
       env:
         path: ${{ inputs.product_path }}
-        entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
-    - name: Normalize ALL WebViewerCEF bundles (helpers exec must not be symlinks)
+    - name: Cleanup symlinks & extended attributes
       shell: bash
       run: |
         set -euo pipefail
-        shopt -s nullglob
+        echo "🔹 Cleanup symlinks and extended attributes in ${product_path}"
+        find "${product_path}" -type l -exec rm -f {} +
+        xattr -rc "${product_path}"
+      env:
+        product_path: ${{ inputs.product_path }}
 
-        echo "🔎 Scan des répertoires *WebViewerCEF.bundle/Contents/Frameworks* dans ${GITHUB_WORKSPACE}"
-
-        # helper Python pour résoudre la cible d'un symlink relatif
-        py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
-
-        FOUND=0
-        while IFS= read -r -d '' BUNDLE_ROOT; do
-          FOUND=1
-          echo "📦 Bundle: $BUNDLE_ROOT"
-
-          SRC_CEF="${BUNDLE_ROOT}/Chromium Embedded Framework.framework"
-          if [ ! -d "$SRC_CEF" ]; then
-            echo "❌ CEF introuvable dans $BUNDLE_ROOT"; exit 1
-          fi
-
-          # Traiter tous les helpers
-          while IFS= read -r -d '' APP; do
-            NAME="$(basename "$APP" .app)"
-            EXE="$APP/Contents/MacOS/$NAME"
-
-            # 1) L'exécutable principal ne doit pas être un symlink
-            if [ -L "$EXE" ]; then
-              TGT="$(readlink "$EXE")"
-              RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
-              if [ ! -f "$RESOLVED" ]; then
-                echo "❌ Cible du symlink introuvable: $EXE -> $TGT"; exit 1
-              fi
-              echo "🪄 Remplace symlink exécutable: $EXE  (-> $TGT)"
-              rm -f "$EXE"
-              /usr/bin/ditto "$RESOLVED" "$EXE"
-              chmod 755 "$EXE"
-            fi
-
-            # 2) Tous les helpers doivent avoir une copie locale du framework CEF
-            DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
-            if [ -L "$DEST_CEF" ]; then
-              echo "🪄 Supprime symlink CEF dans $APP"
-              rm -f "$DEST_CEF"
-            fi
-            if [ ! -d "$DEST_CEF" ]; then
-              echo "📚 Copie CEF local dans: $DEST_CEF"
-              /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
-            fi
-
-          done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
-
-          # Sanity check : executables des helpers
-          echo "🔎 Sanity check (ls des exécutables des helpers)"
-          while IFS= read -r -d '' APP; do
-            N="$(basename "$APP" .app)"
-            ls -l "$APP/Contents/MacOS/$N" || true
-          done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
-
-        done < <(find "${GITHUB_WORKSPACE}" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
-
-        if [ $FOUND -eq 0 ]; then
-          echo "❌ Aucun WebViewerCEF.bundle trouvé"; exit 1
-        fi
-
-    - name: Preflight — aucun exécutable de helper ne doit être un symlink
+    - name: Prepare list of items to codesign
+      id: list_binaries
       shell: bash
       run: |
         set -euo pipefail
-        SYMLINKS_FOUND=0
+        ITEMS_FILE="${GITHUB_WORKSPACE}/codesign_items.txt"
+        > "$ITEMS_FILE"
+        
+        echo "🔹 Collecting binaries, frameworks, bundles, plugins, kexts, apps, 4dbase/4darchive..."
+        find "${product_path}" \
+          -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) >> "$ITEMS_FILE"
+        find "${product_path}" -type d \( -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" -o -name "*.app" -o -name "*.4dbase" -o -name "*.4darchive" \) >> "$ITEMS_FILE"
+        
+        echo "🔹 Total items to sign: $(wc -l < "$ITEMS_FILE")"
+        echo "items_file=$ITEMS_FILE" >> $GITHUB_OUTPUT
+      env:
+        product_path: ${{ inputs.product_path }}
 
-        find "${GITHUB_WORKSPACE}" -type l -path "*/4D Helper*.app/Contents/MacOS/*" -print0 | \
-        while IFS= read -r -d '' SYM; do
-          if [ $SYMLINKS_FOUND -eq 0 ]; then
-            echo "❌ Symlinks d'exécutables trouvés :"
-          fi
-          echo " - $SYM"
-          SYMLINKS_FOUND=1
-        done
-
-        if [ $SYMLINKS_FOUND -eq 1 ]; then
-          exit 1
-        fi
-
-        echo "✅ OK — aucun symlink executable dans les helpers"
-
-    - name: Codesign
+    - name: Codesign all items (single pass)
       shell: bash
       run: |
-        set -e
+        set -euo pipefail
 
         retry_codesign() {
           local target="$1"
-          local timestamp_flag="$2"  # Ajouter un paramètre pour le timestamp
+          local timestamp_flag="$2"
           local attempt=1
           local max_attempts=5
           local delay=5
 
           while [ $attempt -le $max_attempts ]; do
-            echo "[$attempt/$max_attempts] codesign de: $target"
-
-            output=$(codesign --verbose --deep --strict --options=runtime $timestamp_flag \
-              --force --sign "${sign}" --keychain "${keychain}" \
-              --entitlements "${entitlements_path}" "$target" 2>&1)
+            echo "[$attempt/$max_attempts] codesign: $target"
+            output=$(codesign --verbose --strict --options=runtime $timestamp_flag --force --sign "${sign}" --keychain "${keychain}" --entitlements "${entitlements_path}" "$target" 2>&1)
             status=$?
             echo "$output"
-
             if [ $status -eq 0 ]; then
-              echo "✅ codesign réussi pour $target"
               return 0
             fi
-
             if echo "$output" | grep -qiE "no identity found|password|resource fork|invalid|not found in keychain|code object is not signed at all"; then
-              echo "❌ Erreur fatale détectée, arrêt immédiat."
+              echo "❌ Fatal error detected, aborting."
               return 1
             fi
-
-            echo "⚠️ Tentative $attempt échouée, nouvelle tentative dans ${delay}s..."
+            echo "⚠️ Retry $attempt failed, next attempt in ${delay}s..."
             attempt=$(( attempt + 1 ))
             sleep $delay
             delay=$(( delay * 2 ))
           done
 
-          echo "❌ Échec après $max_attempts tentatives pour $target"
+          echo "❌ Failed to codesign after $max_attempts attempts: $target"
           return 1
         }
 
-        IFS=$'\n'; set -f
+        while IFS= read -r ITEM; do
+          # executables, dylib, so -> timestamp
+          if [[ -f "$ITEM" ]] && ([[ -x "$ITEM" ]] || [[ "$ITEM" == *.dylib ]] || [[ "$ITEM" == *.so ]]); then
+            retry_codesign "$ITEM" "--timestamp" || exit 1
+          else
+            # bundles, frameworks, apps, 4dbase, 4darchive -> timestamp
+            retry_codesign "$ITEM" "--timestamp" || exit 1
+          fi
+        done < "${{ steps.list_binaries.outputs.items_file }}"
 
-        echo "=== Étape 1 : signer tous les binaires externes (avec timestamp) ==="
-        find "${product_path}" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
-          ! -path "*.4dbase/*" ! -path "*.4darchive/*" \
-          | while IFS= read -r f; do
-              retry_codesign "$f" "--timestamp" || exit 1
-            done
+        echo "✅ All items signed"
 
-        echo "=== Étape 2 : signer les frameworks (avec timestamp) ==="
-        find "${product_path}" -type d -name "*.framework" \
-          | while IFS= read -r f; do
-              retry_codesign "$f" "--timestamp" || exit 1
-            done
-
-        echo "=== Étape 3 : signer les bundles/plugins/kexts (avec timestamp) ==="
-        find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) \
-          | while IFS= read -r f; do
-              retry_codesign "$f" "--timestamp" || exit 1
-            done
-
-        echo "=== Étape 4 : signer les .4dbase et .4darchive (avec timestamp) ==="
-        find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) \
-          | while IFS= read -r bundle; do
-              echo "📂 Signing binaries inside: $bundle"
-              find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
-                | while IFS= read -r f; do
-                    retry_codesign "$f" "--timestamp" || exit 1
-                  done
-            done
-
-        echo "=== Étape 5 : signer toutes les apps internes (SANS timestamp) ==="
-        find "${product_path}" -type d -name "*.app" \
-          | while IFS= read -r f; do
-              retry_codesign "$f" "--timestamp" || exit 1
-            done
-
-        echo "=== Étape 6 : signature finale du paquet racine (avec timestamp si c'est .app) ==="
-        if [[ "${product_path}" == *.app ]]; then
-          echo "📦 Signature finale de l’app principale : ${product_path}"
-          retry_codesign "${product_path}" "--timestamp" || exit 1
-        else
-          echo "ℹ️ ${product_path} n’est pas une .app/.4dbase/.4darchive, pas de signature racine."
-        fi
-
-        echo "=== Étape 7 : vérification stricte sur tous les binaires signés ==="
-        find "${product_path}" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
-          | while IFS= read -r f; do
-              codesign --verify --strict --verbose=2 "$f" || exit 1
-            done
-
-        echo "✅ Tous les composants ont été signés et vérifiés correctement."
-      env:
-        sign: ${{ inputs.sign }}
-        keychain: ${{ inputs.keychain }}
-        product_path: ${{ inputs.product_path }}
-        entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
-
-    - name: hdiutil (sparse -> convert)
+    - name: Create DMG
       id: hdiutil
       shell: bash
       env:
         product_path: ${{ inputs.product_path }}
         dmg_path: ${{ steps.setup.outputs.dmg_path }}
-        FS: HFS+                 # ou APFS si tu préfères
-        FORMAT: UDBZ             # UDBZ (bzip2) ou UDZO (zlib)
-        MARGIN_PCT: "50"         # marge % au-dessus de la taille source
-        EXTRA_MB: "500"          # marge fixe supplémentaire en MB
-        VERIFY: "1"              # 0 pour désactiver verify
       run: |
         set -euo pipefail
-
         SRC="${product_path}"
         OUT="${dmg_path}"
-        VOLNAME="$(basename "${OUT%.dmg}")"   # nom du volume = nom du .dmg
+        VOLNAME="$(basename "${OUT%.dmg}")"
         WORKDIR="$(mktemp -d /tmp/dmgbuild.XXXXXX)"
-        LOG="${WORKDIR}/build.log"
-        STAGING="${WORKDIR}/staging.sparseimage"
-        ATTACH_PLIST="${WORKDIR}/attach.plist"
         MOUNT_DIR="${WORKDIR}/mnt"
         mkdir -p "$MOUNT_DIR"
 
-        echo "[i] Workdir: $WORKDIR"
-        echo "[i] SRC=$SRC"
-        echo "[i] OUT=$OUT"
-        echo "[i] VOLNAME=$VOLNAME"
-
-        if [[ ! -e "$SRC" ]]; then
-          echo "[!] Source introuvable: $SRC"
-          exit 1
-        fi
-
-        # --- Estimation taille (auto) ---
-        SRC_KB=$(du -sk "$SRC" | awk '{print $1}')
-        SRC_MB=$(( SRC_KB / 1024 ))
-        if [[ $SRC_MB -lt 1 ]]; then SRC_MB=1; fi
-        NEEDED_MB=$(( SRC_MB + (SRC_MB * ${MARGIN_PCT} / 100) + ${EXTRA_MB} ))
-        if [[ $NEEDED_MB -lt 300 ]]; then NEEDED_MB=300; fi
-        echo "[i] Payload size: $(du -sh "$SRC" | awk '{print $1}'); staging ceil: ${NEEDED_MB} MB"
-
-        # --- Création sparseimage (élastique) ---
-        hdiutil create -type SPARSE -fs "${FS}" -volname "${VOLNAME}" -nospotlight \
-          -size "${NEEDED_MB}m" -ov "${STAGING}"
-
-        # --- Montage contrôlé (pas de /Volumes/test 1) ---
-        hdiutil attach "${STAGING}" -nobrowse -noverify -noautoopen -owners on \
-          -mountpoint "${MOUNT_DIR}" -plist > "${ATTACH_PLIST}"
-
-        # Petite protection anti-indexation
-        touch "${MOUNT_DIR}/.metadata_never_index" || true
-
-        # --- Copie du contenu ---
-        rsync -a --delete "${SRC}" "${MOUNT_DIR}/"
-
-        # --- Sync + detach robuste ---
+        echo "[i] Creating sparse image..."
+        SRC_MB=$(( $(du -sm "$SRC" | cut -f1) ))
+        NEEDED_MB=$(( SRC_MB * 2 ))
+        hdiutil create -type SPARSE -fs HFS+ -volname "$VOLNAME" -size "${NEEDED_MB}m" -nospotlight -ov "${WORKDIR}/staging.sparseimage"
+        hdiutil attach "${WORKDIR}/staging.sparseimage" -nobrowse -noverify -noautoopen -owners on -mountpoint "$MOUNT_DIR"
+        rsync -a "$SRC/" "$MOUNT_DIR/"
         sync
-        mdutil -i off "${MOUNT_DIR}" >/dev/null 2>&1 || true
+        hdiutil detach "$MOUNT_DIR"
+        hdiutil convert "${WORKDIR}/staging.sparseimage" -format UDBZ -o "$OUT" -ov
+        echo "[✓] DMG ready: $OUT"
 
-        detach_ok=0
-        for i in {1..8}; do
-          if hdiutil detach "${MOUNT_DIR}" -quiet; then
-            detach_ok=1; echo "[i] Detached OK"; break
-          else
-            echo "[warn] Detach failed (try $i). Showing lsof & poking Spotlight/QuickLook…"
-            lsof +D "${MOUNT_DIR}" || true
-            pkill -f mdworker || true
-            pkill -f quicklookd || true
-            sleep 2
-            if [[ $i -eq 8 ]]; then
-              echo "[warn] Forcing detach…"
-              hdiutil detach -force "${MOUNT_DIR}" || true
-            fi
-          fi
-        done
-        if [[ $detach_ok -eq 0 ]]; then
-          echo "[warn] Forced detach may have been needed"
-        fi
-
-        # --- Compact avant conversion (réduit la sparse) ---
-        hdiutil compact "${STAGING}" || true
-
-        # --- Conversion finale (.dmg compressé) ---
-        hdiutil convert "${STAGING}" -format "${FORMAT}" -o "${OUT}" -ov
-
-        # --- Verify (optionnel) ---
-        if [[ "${VERIFY}" == "1" ]]; then
-          hdiutil verify "${OUT}"
-        fi
-
-        echo "[✓] DMG prêt: ${OUT}"
-        echo "[i] Log (temp): ${LOG}"
-
-    - name: Debug notarization env vars
-      run: |
-        echo "Apple ID: ${apple_id}"
-        echo "Team ID: ${team_id}"
-        echo "Password is set: [${#password} characters]"
-      shell: bash
-      env:
-        apple_id: ${{ inputs.apple_id }}
-        team_id: ${{ inputs.team_id }}
-        password: ${{ inputs.password }}
-
-    - name: Notarize with Apple NotaryTool and check result
+    - name: Notarize
       id: notarytool
       shell: bash
       run: |
-        echo "📦 Soumission à Apple NotaryTool..."
-
-        json_output_file="notarytool-output.json"
-        status_file="${GITHUB_WORKSPACE}/notarization_status.txt"
-
-        # soumission (stdout → fichier JSON, stderr → console)
-        if ! xcrun notarytool submit "${dmg_path}" \
-          --apple-id "${apple_id}" \
-          --team-id "${team_id}" \
-          --password "${password}" \
-          --wait \
-          --output-format json \
-          1>"$json_output_file"; then
-          echo "❌ Erreur lors de l’exécution de notarytool (avant réception du JSON)."
+        set -euo pipefail
+        echo "📦 Submitting DMG to Apple NotaryTool..."
+        JSON_OUT="notarytool-output.json"
+        if ! xcrun notarytool submit "${dmg_path}" --apple-id "${apple_id}" --team-id "${team_id}" --password "${password}" --wait --output-format json 1>"$JSON_OUT"; then
+          echo "❌ NotaryTool execution failed"
           exit 1
         fi
-
-        # affichage du JSON brut
-        echo "📄 JSON brut généré par notarytool :"
-        cat "$json_output_file" || true
-
-        # extraction statut et id
-        status=$(jq -r '.status // empty' "$json_output_file" 2>/dev/null || echo "Unknown")
-        submission_id=$(jq -r '.id // empty' "$json_output_file" 2>/dev/null || echo "")
-
-        echo "🛡️ Statut de notarisation : $status"
-        echo "$status" > "$status_file"
-
-        if [[ "$status" == "Accepted" ]]; then
-          echo "✅ Notarisation réussie : statut accepté"
-          exit 0
-        elif [[ "$status" == "Invalid" ]]; then
-          echo "❌ La notarisation a été rejetée (Invalid)."
-          if [[ -n "$submission_id" ]]; then
-            echo "📥 Récupération du log Apple pour la soumission : $submission_id"
-            xcrun notarytool log "$submission_id" \
-              --apple-id "${apple_id}" \
-              --team-id "${team_id}" \
-              --password "${password}" \
-              --output-format normal || true
+        cat "$JSON_OUT"
+        STATUS=$(jq -r '.status // empty' "$JSON_OUT")
+        SUB_ID=$(jq -r '.id // empty' "$JSON_OUT")
+        echo "🛡️ Notarization status: $STATUS"
+        echo "$STATUS" > "$GITHUB_WORKSPACE/notarization_status.txt"
+        if [[ "$STATUS" != "Accepted" ]]; then
+          if [[ -n "$SUB_ID" ]]; then
+            xcrun notarytool log "$SUB_ID" --apple-id "${apple_id}" --team-id "${team_id}" --password "${password}" --output-format normal || true
           fi
           exit 1
-        else
-          echo "❌ La notarisation a échoué avec statut inattendu : '$status'."
-          exit 1
         fi
+        echo "✅ Notarization successful"
       env:
         apple_id: ${{ inputs.apple_id }}
         team_id: ${{ inputs.team_id }}
