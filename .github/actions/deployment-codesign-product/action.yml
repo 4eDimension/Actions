@@ -36,17 +36,25 @@ runs:
   using: "composite"
   steps:
 
-    - name: Setup
+    - name: Setup entitlements
       id: setup
       shell: bash
       run: |
-        echo "dmg_path=${{ inputs.dmg_path }}" >> $GITHUB_OUTPUT
-        curl -sL 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist' -o entitlements.plist
-        echo "entitlements_path=${GITHUB_WORKSPACE}/entitlements.plist" >> $GITHUB_OUTPUT
+        set -euo pipefail
+        entitlements_file="${GITHUB_WORKSPACE}/entitlements.plist"
+        curl -sL "${entitlements_url}" -o "$entitlements_file"
+        if [[ ! -f "$entitlements_file" ]]; then
+          echo "❌ Fichier d’entitlements manquant"
+          exit 1
+        fi
+        echo "entitlements_path=$entitlements_file" >> $GITHUB_OUTPUT
+      env:
+        entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
-    - name: Export Codesign Variables
+    - name: Export codesign variables
       shell: bash
       run: |
+        set -euo pipefail
         export sign="${{ inputs.sign }}"
         export keychain="${{ inputs.keychain }}"
         export product_path="${{ inputs.product_path }}"
@@ -58,11 +66,13 @@ runs:
       run: |
         set -euo pipefail
 
-        # Variables depuis les inputs GitHub Actions, sécurisées avec fallback
-        sign="${{ inputs.sign }}"
-        keychain="${{ inputs.keychain }}"
-        product_path="${{ inputs.product_path }}"
-        entitlements_path="${{ steps.setup.outputs.entitlements_path }}"
+        # Vérifier que toutes les variables sont définies
+        for var in sign keychain product_path entitlements_path; do
+          if [[ -z "${!var}" ]]; then
+            echo "❌ Variable manquante: $var"
+            exit 1
+          fi
+        done
 
         retry_codesign() {
           local target="$1"
@@ -72,11 +82,11 @@ runs:
           while [ $attempt -le $max_attempts ]; do
             echo "[$attempt/$max_attempts] codesign de: $target"
             if codesign --verbose --deep --strict --options=runtime --timestamp \
-              --force --sign "${sign}" --keychain "${keychain}" --entitlements "${entitlements_path}" "$target"; then
+              --force --sign "$sign" --keychain "$keychain" --entitlements "$entitlements_path" "$target"; then
               echo "✅ codesign réussi pour $target"
               return 0
             fi
-            echo "⚠️ Tentative $attempt échouée, nouvelle tentative dans ${delay}s..."
+            echo "⚠️ Tentative $attempt échouée, prochaine dans ${delay}s..."
             sleep $delay
             attempt=$(( attempt + 1 ))
             delay=$(( delay * 2 ))
@@ -85,17 +95,19 @@ runs:
           return 1
         }
 
-        export -f retry_codesign
-        CPU_CORES=$(sysctl -n hw.ncpu)
+        # Signer tous les bundles / apps / 4dbase / 4darchive
+        while IFS= read -r -d '' item; do
+          retry_codesign "$item" || exit 1
+        done < <(find "$product_path" -type d \( -name "*.app" -o -name "*.4dbase" -o -name "*.4darchive" \) -print0)
 
-        find "${product_path}" -type d \( \
-          -name "*.app" -o -name "*.4dbase" -o -name "*.4darchive" \
-          -o -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \
-        \) -print0 | xargs -0 -n1 -P"$CPU_CORES" bash -c 'retry_codesign "$0"'
+        # Signer frameworks / plugins / bundles / kext
+        while IFS= read -r -d '' item; do
+          retry_codesign "$item" || exit 1
+        done < <(find "$product_path" -type d \( -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
-        # Signature finale si .app
-        if [[ "${product_path}" == *.app ]]; then
-          retry_codesign "$product_path"
+        # Signature finale de la racine si .app
+        if [[ "$product_path" == *.app ]]; then
+          retry_codesign "$product_path" || exit 1
         fi
 
         echo "✅ Tous les composants signés (batch) et vérifiés."
@@ -127,6 +139,7 @@ runs:
       id: notarytool
       shell: bash
       run: |
+        set -euo pipefail
         echo "📦 Soumission à Apple NotaryTool..."
         xcrun notarytool submit "${{ inputs.dmg_path }}" \
           --apple-id "${{ inputs.apple_id }}" \
@@ -139,10 +152,9 @@ runs:
         submission_id=$(jq -r '.id // empty' notarytool-output.json)
         echo "🛡️ Statut notarisation: $status"
 
-        echo "$status" > notarization_status.txt
-
         if [[ "$status" == "Accepted" ]]; then
           echo "✅ Notarisation réussie"
+          echo "notarization_status=$status" >> $GITHUB_OUTPUT
           exit 0
         elif [[ "$status" == "Invalid" ]]; then
           echo "❌ Notarisation rejetée"
