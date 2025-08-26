@@ -38,24 +38,31 @@ runs:
 
     - name: setup
       id: setup
-      shell: bash
-      env:
-        path: ${{ inputs.product_path }}
-        entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
       run: |
         echo "dmg_path=${{ inputs.dmg_path }}" >> $GITHUB_OUTPUT
         curl "${entitlements_url}" -o entitlements.plist -sL
         echo "entitlements_path=${GITHUB_WORKSPACE}/entitlements.plist" >> $GITHUB_OUTPUT
+      shell: bash
+      env:
+        path: ${{ inputs.product_path }}
+        entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
+
+    - name: Export codesign variables
+      shell: bash
+      run: |
+        export sign="${{ inputs.sign }}"
+        export keychain="${{ inputs.keychain }}"
+        export entitlements_path="${{ steps.setup.outputs.entitlements_path }}"
+        echo "✅ Variables codesign exportées pour toutes les boucles"
 
     - name: Codesign
       shell: bash
-      env:
-        sign: ${{ inputs.sign }}
-        keychain: ${{ inputs.keychain }}
-        entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
-        product_path: ${{ inputs.product_path }}
       run: |
         set -euo pipefail
+        export sign="${sign}"
+        export keychain="${keychain}"
+        export entitlements_path="${entitlements_path}"
+        export product_path="${product_path}"
 
         retry_codesign() {
           local target="$1"
@@ -78,17 +85,22 @@ runs:
           return 1
         }
 
-        # Signer tous les bundles / apps / 4dbase / 4darchive
+        # Signer tous les fichiers .dylib
         while IFS= read -r -d '' item; do
           retry_codesign "$item" || exit 1
-        done < <(find "${product_path}" -type d \( -name "*.app" -o -name "*.4dbase" -o -name "*.4darchive" \) -print0)
+        done < <(find "${product_path}" -type f -name "*.dylib" -print0)
+
+        # Signer tous les bundles / apps / 4darchive (mais pas .4dbase)
+        while IFS= read -r -d '' item; do
+          retry_codesign "$item" || exit 1
+        done < <(find "${product_path}" -type d \( -name "*.app" -o -name "*.4darchive" \) -print0)
 
         # Signer frameworks / plugins / bundles / kext
         while IFS= read -r -d '' item; do
           retry_codesign "$item" || exit 1
         done < <(find "${product_path}" -type d \( -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
-        # Signature finale de la racine si .app
+        # Signature finale de la racine si c'est un .app
         if [[ "${product_path}" == *.app ]]; then
           retry_codesign "$product_path" || exit 1
         fi
@@ -122,42 +134,29 @@ runs:
         echo "[✓] DMG ready: $OUT"
 
     - name: Notarize with Apple NotaryTool
-      id: notarytool
       shell: bash
-      env:
-        apple_id: ${{ inputs.apple_id }}
-        team_id: ${{ inputs.team_id }}
-        password: ${{ inputs.password }}
-        dmg_path: ${{ inputs.dmg_path }}
       run: |
         echo "📦 Soumission à Apple NotaryTool..."
-        xcrun notarytool submit "${dmg_path}" \
-          --apple-id "${apple_id}" \
-          --team-id "${team_id}" \
-          --password "${password}" \
+        xcrun notarytool submit "${{ inputs.dmg_path }}" \
+          --apple-id "${{ inputs.apple_id }}" \
+          --team-id "${{ inputs.team_id }}" \
+          --password "${{ inputs.password }}" \
           --wait \
           --output-format json > notarytool-output.json
 
         status=$(jq -r '.status // empty' notarytool-output.json)
         submission_id=$(jq -r '.id // empty' notarytool-output.json)
         echo "🛡️ Statut notarisation: $status"
-        echo "notarization_status=$status" >> $GITHUB_OUTPUT
 
         if [[ "$status" == "Accepted" ]]; then
           echo "✅ Notarisation réussie"
-
-          # Staple DMG pour que la signature soit attachée localement
-          echo "🔗 Application du stapler sur le DMG..."
-          xcrun stapler staple "${dmg_path}"
-          echo "✅ Stapling terminé"
-
           exit 0
         elif [[ "$status" == "Invalid" ]]; then
           echo "❌ Notarisation rejetée"
           xcrun notarytool log "$submission_id" \
-            --apple-id "${apple_id}" \
-            --team-id "${team_id}" \
-            --password "${password}" \
+            --apple-id "${{ inputs.apple_id }}" \
+            --team-id "${{ inputs.team_id }}" \
+            --password "${{ inputs.password }}" \
             --output-format normal || true
           exit 1
         else
