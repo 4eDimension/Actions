@@ -1,5 +1,5 @@
-name: Codesign & Notarize Product
-description: Sign, package and submit product to Apple Notary
+name: Codesign Product
+description: Submit product to Apple Notary
 
 inputs:
   sign:
@@ -41,10 +41,10 @@ runs:
       shell: bash
       run: |
         echo "dmg_path=${{ inputs.dmg_path }}" >> $GITHUB_OUTPUT
-        curl -sL "${ENTITLEMENTS_URL}" -o entitlements.plist
+        curl -sL "${entitlements_url}" -o entitlements.plist
         echo "entitlements_path=${GITHUB_WORKSPACE}/entitlements.plist" >> $GITHUB_OUTPUT
       env:
-        ENTITLEMENTS_URL: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
+        entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
     - name: Codesign
       shell: bash
@@ -56,12 +56,14 @@ runs:
       run: |
         set -euo pipefail
 
+        VALID_ITEMS=()
+
         retry_codesign() {
           local target="$1"
           local attempt=1
           local max_attempts=3
           local delay=5
-          
+
           if [ ! -e "$target" ]; then
             echo "⚠️ Ignoring non-existent target: $target"
             return 0
@@ -85,8 +87,6 @@ runs:
         }
 
         echo "[i] Collecting valid Mach-O and bundle items..."
-        # Liste des items valides
-        VALID_ITEMS=()
         while IFS= read -r -d '' item; do
           if file "$item" | grep -qE 'Mach-O|bundle'; then
             VALID_ITEMS+=("$item")
@@ -95,10 +95,19 @@ runs:
 
         echo "[i] Found ${#VALID_ITEMS[@]} valid items to sign."
 
-        # Sign items en parallèle avec xargs
-        printf "%s\0" "${VALID_ITEMS[@]}" | xargs -0 -n1 -P4 bash -c 'retry_codesign "$0"' || exit 1
+        if [ ${#VALID_ITEMS[@]} -gt 0 ]; then
+          # parallélisation légère avec 4 jobs max
+          printf "%s\0" "${VALID_ITEMS[@]}" | xargs -0 -n1 -P4 bash -c 'retry_codesign "$0"' || exit 1
+        else
+          echo "[i] No valid items found to sign, skipping codesign."
+        fi
 
-        echo "✅ Tous les composants valides signés."
+        # Signer la racine si c'est une app
+        if [[ "${product_path}" == *.app ]]; then
+          retry_codesign "$product_path" || exit 1
+        fi
+
+        echo "✅ Tous les composants valides signés (ou aucun à signer)."
 
     - name: Create DMG
       id: hdiutil
@@ -130,54 +139,38 @@ runs:
       id: notarytool
       shell: bash
       env:
-        dmg_path: ${{ steps.setup.outputs.dmg_path }}
         apple_id: ${{ inputs.apple_id }}
         team_id: ${{ inputs.team_id }}
         password: ${{ inputs.password }}
+        dmg_path: ${{ steps.setup.outputs.dmg_path }}
       run: |
         set -euo pipefail
-        max_attempts=3
-        attempt=1
-        delay=30
+        echo "📦 Soumission à Apple NotaryTool..."
+        xcrun notarytool submit "${dmg_path}" \
+          --apple-id "${apple_id}" \
+          --team-id "${team_id}" \
+          --password "${password}" \
+          --wait \
+          --output-format json > notarytool-output.json
 
-        while [ $attempt -le $max_attempts ]; do
-          echo "📦 Submission to Apple NotaryTool, attempt $attempt..."
-          if xcrun notarytool submit "${dmg_path}" \
+        status=$(jq -r '.status // empty' notarytool-output.json)
+        submission_id=$(jq -r '.id // empty' notarytool-output.json)
+        echo "🛡️ Statut notarisation: $status"
+
+        echo "$status" > notarization_status.txt
+
+        if [[ "$status" == "Accepted" ]]; then
+          echo "✅ Notarisation réussie"
+          exit 0
+        elif [[ "$status" == "Invalid" ]]; then
+          echo "❌ Notarisation rejetée"
+          xcrun notarytool log "$submission_id" \
             --apple-id "${apple_id}" \
             --team-id "${team_id}" \
             --password "${password}" \
-            --wait \
-            --output-format json > notarytool-output.json; then
-              
-              status=$(jq -r '.status // empty' notarytool-output.json)
-              submission_id=$(jq -r '.id // empty' notarytool-output.json)
-              echo "🛡️ Notarization status: $status"
-              
-              if [[ "$status" == "Accepted" ]]; then
-                echo "✅ Notarization succeeded"
-                break
-              elif [[ "$status" == "Invalid" ]]; then
-                echo "❌ Notarization rejected"
-                xcrun notarytool log "$submission_id" \
-                  --apple-id "${apple_id}" \
-                  --team-id "${team_id}" \
-                  --password "${password}" \
-                  --output-format normal || true
-                exit 1
-              else
-                echo "⚠️ Unexpected status: $status"
-              fi
-          else
-            echo "⚠️ Submission failed, retrying in $delay seconds..."
-          fi
-          sleep $delay
-          attempt=$(( attempt + 1 ))
-          delay=$(( delay * 2 ))
-        done
-
-        if [[ "$status" != "Accepted" ]]; then
-          echo "❌ Notarization ultimately failed after $max_attempts attempts."
+            --output-format normal || true
+          exit 1
+        else
+          echo "❌ Statut inattendu: $status"
           exit 1
         fi
-
-        echo "✅ Notarization completed successfully"
