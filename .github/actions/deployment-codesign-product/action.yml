@@ -36,15 +36,102 @@ runs:
   using: "composite"
   steps:
 
-    - name: Setup
+    - name: setup
       id: setup
-      shell: bash
       run: |
         echo "dmg_path=${{ inputs.dmg_path }}" >> $GITHUB_OUTPUT
-        curl -sL "${entitlements_url}" -o entitlements.plist
+        curl "${entitlements_url}" -o entitlements.plist -sL
         echo "entitlements_path=${GITHUB_WORKSPACE}/entitlements.plist" >> $GITHUB_OUTPUT
+      shell: bash
       env:
+        path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
+
+    - name: Normalize ALL WebViewerCEF bundles (helpers exec must not be symlinks)
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+
+        echo "🔎 Scan des répertoires *WebViewerCEF.bundle/Contents/Frameworks* dans ${GITHUB_WORKSPACE}"
+
+        # helper Python pour résoudre la cible d'un symlink relatif
+        py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
+
+        FOUND=0
+        while IFS= read -r -d '' BUNDLE_ROOT; do
+          FOUND=1
+          echo "📦 Bundle: $BUNDLE_ROOT"
+
+          SRC_CEF="${BUNDLE_ROOT}/Chromium Embedded Framework.framework"
+          if [ ! -d "$SRC_CEF" ]; then
+            echo "❌ CEF introuvable dans $BUNDLE_ROOT"; exit 1
+          fi
+
+          # Traiter tous les helpers
+          while IFS= read -r -d '' APP; do
+            NAME="$(basename "$APP" .app)"
+            EXE="$APP/Contents/MacOS/$NAME"
+
+            # 1) L'exécutable principal ne doit pas être un symlink
+            if [ -L "$EXE" ]; then
+              TGT="$(readlink "$EXE")"
+              RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
+              if [ ! -f "$RESOLVED" ]; then
+                echo "❌ Cible du symlink introuvable: $EXE -> $TGT"; exit 1
+              fi
+              echo "🪄 Remplace symlink exécutable: $EXE  (-> $TGT)"
+              rm -f "$EXE"
+              /usr/bin/ditto "$RESOLVED" "$EXE"
+              chmod 755 "$EXE"
+            fi
+
+            # 2) Tous les helpers doivent avoir une copie locale du framework CEF
+            DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+            if [ -L "$DEST_CEF" ]; then
+              echo "🪄 Supprime symlink CEF dans $APP"
+              rm -f "$DEST_CEF"
+            fi
+            if [ ! -d "$DEST_CEF" ]; then
+              echo "📚 Copie CEF local dans: $DEST_CEF"
+              /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
+            fi
+
+          done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
+
+          # Sanity check : executables des helpers
+          echo "🔎 Sanity check (ls des exécutables des helpers)"
+          while IFS= read -r -d '' APP; do
+            N="$(basename "$APP" .app)"
+            ls -l "$APP/Contents/MacOS/$N" || true
+          done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
+
+        done < <(find "${GITHUB_WORKSPACE}" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
+
+        if [ $FOUND -eq 0 ]; then
+          echo "❌ Aucun WebViewerCEF.bundle trouvé"; exit 1
+        fi
+
+    - name: Preflight — aucun exécutable de helper ne doit être un symlink
+      shell: bash
+      run: |
+        set -euo pipefail
+        SYMLINKS_FOUND=0
+
+        find "${GITHUB_WORKSPACE}" -type l -path "*/4D Helper*.app/Contents/MacOS/*" -print0 | \
+        while IFS= read -r -d '' SYM; do
+          if [ $SYMLINKS_FOUND -eq 0 ]; then
+            echo "❌ Symlinks d'exécutables trouvés :"
+          fi
+          echo " - $SYM"
+          SYMLINKS_FOUND=1
+        done
+
+        if [ $SYMLINKS_FOUND -eq 1 ]; then
+          exit 1
+        fi
+
+        echo "✅ OK — aucun symlink executable dans les helpers"
 
     - name: Codesign
       shell: bash
