@@ -1,5 +1,5 @@
 name: Codesign Product
-description: Submit product to Apple Notary
+description: Submit product to notary
 
 inputs:
   sign:
@@ -232,68 +232,163 @@ runs:
         product_path: ${{ inputs.product_path }}
         entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
 
-    - name: Create DMG
+    - name: hdiutil (sparse -> convert)
       id: hdiutil
       shell: bash
       env:
         product_path: ${{ inputs.product_path }}
         dmg_path: ${{ steps.setup.outputs.dmg_path }}
+        FS: HFS+                 # ou APFS si tu préfères
+        FORMAT: UDBZ             # UDBZ (bzip2) ou UDZO (zlib)
+        MARGIN_PCT: "50"         # marge % au-dessus de la taille source
+        EXTRA_MB: "500"          # marge fixe supplémentaire en MB
+        VERIFY: "1"              # 0 pour désactiver verify
       run: |
         set -euo pipefail
+
         SRC="${product_path}"
         OUT="${dmg_path}"
-        VOLNAME="$(basename "${OUT%.dmg}")"
+        VOLNAME="$(basename "${OUT%.dmg}")"   # nom du volume = nom du .dmg
         WORKDIR="$(mktemp -d /tmp/dmgbuild.XXXXXX)"
+        LOG="${WORKDIR}/build.log"
+        STAGING="${WORKDIR}/staging.sparseimage"
+        ATTACH_PLIST="${WORKDIR}/attach.plist"
         MOUNT_DIR="${WORKDIR}/mnt"
         mkdir -p "$MOUNT_DIR"
 
-        echo "[i] Creating sparse image..."
-        SRC_MB=$(( $(du -sm "$SRC" | cut -f1) ))
-        NEEDED_MB=$(( SRC_MB * 2 ))
-        hdiutil create -type SPARSE -fs HFS+ -volname "$VOLNAME" -size "${NEEDED_MB}m" -nospotlight -ov "${WORKDIR}/staging.sparseimage"
-        hdiutil attach "${WORKDIR}/staging.sparseimage" -nobrowse -noverify -noautoopen -owners on -mountpoint "$MOUNT_DIR"
-        rsync -a "$SRC/" "$MOUNT_DIR/"
-        sync
-        hdiutil detach "$MOUNT_DIR"
-        hdiutil convert "${WORKDIR}/staging.sparseimage" -format UDBZ -o "$OUT" -ov
-        echo "[✓] DMG ready: $OUT"
+        echo "[i] Workdir: $WORKDIR"
+        echo "[i] SRC=$SRC"
+        echo "[i] OUT=$OUT"
+        echo "[i] VOLNAME=$VOLNAME"
 
-    - name: Notarize with Apple NotaryTool
-      id: notarytool
+        if [[ ! -e "$SRC" ]]; then
+          echo "[!] Source introuvable: $SRC"
+          exit 1
+        fi
+
+        # --- Estimation taille (auto) ---
+        SRC_KB=$(du -sk "$SRC" | awk '{print $1}')
+        SRC_MB=$(( SRC_KB / 1024 ))
+        if [[ $SRC_MB -lt 1 ]]; then SRC_MB=1; fi
+        NEEDED_MB=$(( SRC_MB + (SRC_MB * ${MARGIN_PCT} / 100) + ${EXTRA_MB} ))
+        if [[ $NEEDED_MB -lt 300 ]]; then NEEDED_MB=300; fi
+        echo "[i] Payload size: $(du -sh "$SRC" | awk '{print $1}'); staging ceil: ${NEEDED_MB} MB"
+
+        # --- Création sparseimage (élastique) ---
+        hdiutil create -type SPARSE -fs "${FS}" -volname "${VOLNAME}" -nospotlight \
+          -size "${NEEDED_MB}m" -ov "${STAGING}"
+
+        # --- Montage contrôlé (pas de /Volumes/test 1) ---
+        hdiutil attach "${STAGING}" -nobrowse -noverify -noautoopen -owners on \
+          -mountpoint "${MOUNT_DIR}" -plist > "${ATTACH_PLIST}"
+
+        # Petite protection anti-indexation
+        touch "${MOUNT_DIR}/.metadata_never_index" || true
+
+        # --- Copie du contenu ---
+        rsync -a --delete "${SRC}" "${MOUNT_DIR}/"
+
+        # --- Sync + detach robuste ---
+        sync
+        mdutil -i off "${MOUNT_DIR}" >/dev/null 2>&1 || true
+
+        detach_ok=0
+        for i in {1..8}; do
+          if hdiutil detach "${MOUNT_DIR}" -quiet; then
+            detach_ok=1; echo "[i] Detached OK"; break
+          else
+            echo "[warn] Detach failed (try $i). Showing lsof & poking Spotlight/QuickLook…"
+            lsof +D "${MOUNT_DIR}" || true
+            pkill -f mdworker || true
+            pkill -f quicklookd || true
+            sleep 2
+            if [[ $i -eq 8 ]]; then
+              echo "[warn] Forcing detach…"
+              hdiutil detach -force "${MOUNT_DIR}" || true
+            fi
+          fi
+        done
+        if [[ $detach_ok -eq 0 ]]; then
+          echo "[warn] Forced detach may have been needed"
+        fi
+
+        # --- Compact avant conversion (réduit la sparse) ---
+        hdiutil compact "${STAGING}" || true
+
+        # --- Conversion finale (.dmg compressé) ---
+        hdiutil convert "${STAGING}" -format "${FORMAT}" -o "${OUT}" -ov
+
+        # --- Verify (optionnel) ---
+        if [[ "${VERIFY}" == "1" ]]; then
+          hdiutil verify "${OUT}"
+        fi
+
+        echo "[✓] DMG prêt: ${OUT}"
+        echo "[i] Log (temp): ${LOG}"
+
+    - name: Debug notarization env vars
+      run: |
+        echo "Apple ID: ${apple_id}"
+        echo "Team ID: ${team_id}"
+        echo "Password is set: [${#password} characters]"
       shell: bash
       env:
         apple_id: ${{ inputs.apple_id }}
         team_id: ${{ inputs.team_id }}
         password: ${{ inputs.password }}
-        dmg_path: ${{ steps.setup.outputs.dmg_path }}
+
+    - name: Notarize with Apple NotaryTool and check result
+      id: notarytool
+      shell: bash
       run: |
-        set -euo pipefail
         echo "📦 Soumission à Apple NotaryTool..."
-        xcrun notarytool submit "${dmg_path}" \
+
+        json_output_file="notarytool-output.json"
+        status_file="${GITHUB_WORKSPACE}/notarization_status.txt"
+
+        # soumission (stdout → fichier JSON, stderr → console)
+        if ! xcrun notarytool submit "${dmg_path}" \
           --apple-id "${apple_id}" \
           --team-id "${team_id}" \
           --password "${password}" \
           --wait \
-          --output-format json > notarytool-output.json
-
-        status=$(jq -r '.status // empty' notarytool-output.json)
-        submission_id=$(jq -r '.id // empty' notarytool-output.json)
-        echo "🛡️ Statut notarisation: $status"
-
-        echo "$status" > notarization_status.txt
-
-        if [[ "$status" == "Accepted" ]]; then
-          echo "✅ Notarisation réussie"
-          exit 0
-        elif [[ "$status" == "Invalid" ]]; then
-          echo "❌ Notarisation rejetée"
-          xcrun notarytool log "$submission_id" \
-            --apple-id "${apple_id}" \
-            --team-id "${team_id}" \
-            --password "${password}" \
-            --output-format normal || true
-          exit 1
-        else
-          echo "❌ Statut inattendu: $status"
+          --output-format json \
+          1>"$json_output_file"; then
+          echo "❌ Erreur lors de l’exécution de notarytool (avant réception du JSON)."
           exit 1
         fi
+
+        # affichage du JSON brut
+        echo "📄 JSON brut généré par notarytool :"
+        cat "$json_output_file" || true
+
+        # extraction statut et id
+        status=$(jq -r '.status // empty' "$json_output_file" 2>/dev/null || echo "Unknown")
+        submission_id=$(jq -r '.id // empty' "$json_output_file" 2>/dev/null || echo "")
+
+        echo "🛡️ Statut de notarisation : $status"
+        echo "$status" > "$status_file"
+
+        if [[ "$status" == "Accepted" ]]; then
+          echo "✅ Notarisation réussie : statut accepté"
+          exit 0
+        elif [[ "$status" == "Invalid" ]]; then
+          echo "❌ La notarisation a été rejetée (Invalid)."
+          if [[ -n "$submission_id" ]]; then
+            echo "📥 Récupération du log Apple pour la soumission : $submission_id"
+            xcrun notarytool log "$submission_id" \
+              --apple-id "${apple_id}" \
+              --team-id "${team_id}" \
+              --password "${password}" \
+              --output-format normal || true
+          fi
+          exit 1
+        else
+          echo "❌ La notarisation a échoué avec statut inattendu : '$status'."
+          exit 1
+        fi
+      env:
+        apple_id: ${{ inputs.apple_id }}
+        team_id: ${{ inputs.team_id }}
+        password: ${{ inputs.password }}
+        dmg_path: ${{ steps.setup.outputs.dmg_path }}
