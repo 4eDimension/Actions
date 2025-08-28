@@ -189,7 +189,7 @@ runs:
           echo "📦 Signature finale de l’app principale : ${product_path}"
           retry_codesign "${product_path}" "--timestamp" || exit 1
         else
-          echo "ℹ️ ${product_path} n’est pas une .app/.4dbase/.4darchive, pas de signature racine."
+          echo "ℹ️ ${product_path} n’est pas un .app, pas de signature racine."
         fi
 
       env:
