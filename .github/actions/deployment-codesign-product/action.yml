@@ -289,12 +289,12 @@ runs:
         fi
         echo "🆔 Soumission envoyée, ID=$submission_id"
 
-        # Polling (60s) jusqu'à 6h (360 tentatives)
+        # Polling (30s) jusqu'à 1h (120 tentatives)
         attempt=0
-        max_attempts=360
+        max_attempts=120
         status="In Progress"
         while [[ "$status" == "In Progress" && $attempt -lt $max_attempts ]]; do
-          sleep 60
+          sleep 30
           attempt=$((attempt+1))
           echo "⏳ Vérification notarisation (tentative $attempt)..."
           out=$(xcrun notarytool info "$submission_id" \
