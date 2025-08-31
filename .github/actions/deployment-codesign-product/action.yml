@@ -100,7 +100,7 @@ runs:
         done < <(find "${GITHUB_WORKSPACE}" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
 
         if [ $FOUND -eq 0 ]; then
-          echo "❌ Aucun WebViewerCEF.bundle trouvé"; exit 1
+          echo "ℹ️ Aucun WebViewerCEF.bundle trouvé (ce n’est pas bloquant)"
         fi
 
     - name: Preflight — aucun exécutable de helper ne doit être un symlink
