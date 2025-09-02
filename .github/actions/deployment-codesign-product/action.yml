@@ -200,6 +200,7 @@ runs:
 
     - name: hdiutil (sparse -> convert)
       id: hdiutil
+      if: ${{ !contains(inputs.product_path, 'update.mac.4darchive') }}
       shell: bash
       env:
         product_path: ${{ inputs.product_path }}
@@ -252,6 +253,8 @@ runs:
         echo "[✓] DMG prêt: ${OUT}"
 
     - name: Debug notarization env vars
+      id: debug-notarization
+      if: ${{ !contains(inputs.product_path, 'update.mac.4darchive') }}
       run: |
         echo "Apple ID: ${apple_id}"
         echo "Team ID: ${team_id}"
@@ -264,6 +267,7 @@ runs:
 
     - name: Notarize with Apple NotaryTool and check result (polling)
       id: notarytool
+      if: ${{ !contains(inputs.product_path, 'update.mac.4darchive') }}
       shell: bash
       run: |
         set -euo pipefail
