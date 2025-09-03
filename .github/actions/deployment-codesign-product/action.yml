@@ -173,15 +173,28 @@ runs:
         echo "=== Signing contents of .4dbase and .4darchive ==="
         while IFS= read -r -d '' bundle; do
           echo "📂 Signing content inside: $bundle"
+
+          # 1) Exécutables simples et libs
           while IFS= read -r -d '' f; do
             retry_codesign "$f" "--timestamp" || exit 1
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
+
+          # 2) Frameworks
           while IFS= read -r -d '' fw; do
             retry_codesign "$fw" "--timestamp" || exit 1
           done < <(find "$bundle" -type d -name "*.framework" -print0)
+
+          # 3) Bundles, plugins, kexts
           while IFS= read -r -d '' bp; do
             retry_codesign "$bp" "--timestamp" || exit 1
           done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
+
+          # 4) Applications (.app)
+          while IFS= read -r -d '' app; do
+            echo "📦 Signature d’un .app interne: $app"
+            retry_codesign "$app" "--timestamp" || exit 1
+          done < <(find "$bundle" -type d -name "*.app" -print0)
+
         done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
 
         # === Étape 3 : signature finale de l’app principale si applicable ===
