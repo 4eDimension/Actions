@@ -169,33 +169,43 @@ runs:
             ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
         )
 
-        # === Étape 2 : signer le contenu des .4dbase et .4darchive ===
-        echo "=== Signing contents of .4dbase and .4darchive ==="
-        while IFS= read -r -d '' bundle; do
-          echo "📂 Signing content inside: $bundle"
+        # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase)
+        for bundle in "${ARCHIVES[@]}"; do
+          echo "🔑 Traitement de $bundle ..."
 
-          # 1) Exécutables simples et libs
-          while IFS= read -r -d '' f; do
-            retry_codesign "$f" "--timestamp" || exit 1
+          # 1) Exécutables / dylibs / so
+          while IFS= read -r -d '' bin; do
+            retry_codesign "$bin" "--timestamp" || exit 1
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
-          # 2) Frameworks
+          # 2) Frameworks → on signe le binaire interne (Versions/A/<Binary>)
           while IFS= read -r -d '' fw; do
-            retry_codesign "$fw" "--timestamp" || exit 1
+            BIN="$(basename "$fw" .framework)"
+            EXEC="$fw/Versions/A/$BIN"
+            if [ -f "$EXEC" ]; then
+              retry_codesign "$EXEC" "--timestamp" || exit 1
+            else
+              echo "⚠️ Aucun binaire trouvé dans $fw"
+            fi
           done < <(find "$bundle" -type d -name "*.framework" -print0)
 
-          # 3) Bundles, plugins, kexts
-          while IFS= read -r -d '' bp; do
-            retry_codesign "$bp" "--timestamp" || exit 1
-          done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
-
-          # 4) Applications (.app)
+          # 3) .app → on signe leur exécutable principal
           while IFS= read -r -d '' app; do
-            echo "📦 Signature d’un .app interne: $app"
-            retry_codesign "$app" "--timestamp" || exit 1
+            EXEC="$app/Contents/MacOS/$(basename "$app" .app)"
+            if [ -f "$EXEC" ]; then
+              retry_codesign "$EXEC" "--timestamp" || exit 1
+            fi
           done < <(find "$bundle" -type d -name "*.app" -print0)
 
-        done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
+          # 4) .bundle → on signe l’exécutable interne
+          while IFS= read -r -d '' bundle_dir; do
+            EXEC="$bundle_dir/Contents/MacOS/$(basename "$bundle_dir" .bundle)"
+            if [ -f "$EXEC" ]; then
+              retry_codesign "$EXEC" "--timestamp" || exit 1
+            fi
+          done < <(find "$bundle" -type d -name "*.bundle" -print0)
+
+        done
 
         # === Étape 3 : signature finale de l’app principale si applicable ===
         if [[ "${product_path}" == *.app ]]; then
