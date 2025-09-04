@@ -169,43 +169,85 @@ runs:
             ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
         )
 
-        # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase)
-        for bundle in "${ARCHIVES[@]}"; do
-          echo "🔑 Traitement de $bundle ..."
+        # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase) ===
+        echo "=== Signing contents of .4dbase and .4darchive ==="
+        while IFS= read -r -d '' bundle; do
+          echo "📂 Signing content inside: $bundle"
 
-          # 1) Exécutables / dylibs / so
-          while IFS= read -r -d '' bin; do
-            retry_codesign "$bin" "--timestamp" || exit 1
+          # 1) Exécutables simples et libs (.dylib, .so, exécutables)
+          while IFS= read -r -d '' f; do
+            echo "🔧 Signing file: $f"
+            retry_codesign "$f" "--timestamp" || exit 1
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
-          # 2) Frameworks → on signe le binaire interne (Versions/A/<Binary>)
+          # 2) Frameworks → signer le binaire interne (Versions/A ou Versions/Current), puis dylibs, puis le .framework
           while IFS= read -r -d '' fw; do
-            BIN="$(basename "$fw" .framework)"
-            EXEC="$fw/Versions/A/$BIN"
-            if [ -f "$EXEC" ]; then
-              retry_codesign "$EXEC" "--timestamp" || exit 1
-            else
-              echo "⚠️ Aucun binaire trouvé dans $fw"
+            echo "📘 Framework: $fw"
+            fwname="$(basename "$fw" .framework)"
+
+            # Emplacements usuels
+            candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
+            found=""
+            for c in "${candidates[@]}"; do
+              if [ -f "$c" ]; then
+                found="$c"
+                break
+              fi
+            done
+
+            # fallback → premier exécutable trouvé dans le framework
+            if [ -z "$found" ]; then
+              found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
             fi
+
+            if [ -n "$found" ]; then
+              echo "🔧 Signing framework binary: $found"
+              retry_codesign "$found" "--timestamp" || exit 1
+            else
+              echo "⚠️ Aucun binaire exécutable trouvé dans $fw (on signera quand même le .framework)"
+            fi
+
+            # signer les .dylib à l'intérieur du framework
+            while IFS= read -r -d '' dylib; do
+              retry_codesign "$dylib" "--timestamp" || exit 1
+            done < <(find "$fw" -type f -name "*.dylib" -print0)
+
+            # signer le framework lui-même (metadata)
+            retry_codesign "$fw" "--timestamp" || exit 1
+
           done < <(find "$bundle" -type d -name "*.framework" -print0)
 
-          # 3) .app → on signe leur exécutable principal
+          # 3) Applications internes (.app) → signer executable principal, dylibs, puis le .app
           while IFS= read -r -d '' app; do
-            EXEC="$app/Contents/MacOS/$(basename "$app" .app)"
-            if [ -f "$EXEC" ]; then
-              retry_codesign "$EXEC" "--timestamp" || exit 1
+            echo "📦 Internal .app: $app"
+            mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
+            if [ -f "$mainexe" ]; then
+              retry_codesign "$mainexe" "--timestamp" || exit 1
+            else
+              exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
+              if [ -n "$exe" ]; then
+                retry_codesign "$exe" "--timestamp" || exit 1
+              fi
             fi
+
+            while IFS= read -r -d '' dylib; do
+              retry_codesign "$dylib" "--timestamp" || exit 1
+            done < <(find "$app" -type f -name "*.dylib" -print0)
+
+            retry_codesign "$app" "--timestamp" || exit 1
           done < <(find "$bundle" -type d -name "*.app" -print0)
 
-          # 4) .bundle → on signe l’exécutable interne
-          while IFS= read -r -d '' bundle_dir; do
-            EXEC="$bundle_dir/Contents/MacOS/$(basename "$bundle_dir" .bundle)"
-            if [ -f "$EXEC" ]; then
-              retry_codesign "$EXEC" "--timestamp" || exit 1
+          # 4) Bundles / plugins / kext → signer premier exe trouvé puis le conteneur
+          while IFS= read -r -d '' bp; do
+            echo "🔌 Plugin/bundle/kext: $bp"
+            exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
+            if [ -n "$exe" ]; then
+              retry_codesign "$exe" "--timestamp" || exit 1
             fi
-          done < <(find "$bundle" -type d -name "*.bundle" -print0)
+            retry_codesign "$bp" "--timestamp" || exit 1
+          done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
-        done
+        done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
 
         # === Étape 3 : signature finale de l’app principale si applicable ===
         if [[ "${product_path}" == *.app ]]; then
@@ -337,7 +379,7 @@ runs:
         done
 
         echo "${status:-Unknown}" > "$status_file"
-        echo "notarization_status=${status:-Unknown}" >> "$GITHUB_OUTPUT"
+        echo "notarization_status=${status:-Unknown}" >> $GITHUB_OUTPUT
 
         if [[ "$status" == "Accepted" ]]; then
           echo "✅ Notarisation réussie"
