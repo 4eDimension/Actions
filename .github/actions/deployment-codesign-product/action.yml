@@ -162,8 +162,7 @@ runs:
             retry_codesign "$inner" "--timestamp" || exit 1
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" \) -print0)
 
-          # 2.2) Signature du conteneur .4dbase/.4darchive lui-même
-          retry_codesign "$bundle" "--timestamp" || exit 1
+          # ⚠️ pas de signature du conteneur .4dbase/.4darchive (non reconnu par codesign)
 
         done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
 
