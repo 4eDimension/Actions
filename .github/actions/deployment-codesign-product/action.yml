@@ -128,51 +128,52 @@ runs:
       run: |
         set -euo pipefail
 
+        SIGN_ID="${{ inputs.sign }}"
+        PRODUCT_PATH="${{ inputs.product_path }}"
+
+        # === Fonction retry pour codesign ===
         function retry_codesign() {
           local target="$1"
           local opts="${2:-}"
           local attempt=1
           local max_attempts=3
+
           until [ $attempt -gt $max_attempts ]; do
-            if codesign --force --options runtime --sign "${{ inputs.sign }}" $opts "$target"; then
+            if codesign --force --options runtime --sign "$SIGN_ID" $opts "$target"; then
               return 0
             else
-              echo "codesign failed on $target (attempt $attempt)"
+              echo "⚠️ codesign failed on $target (attempt $attempt)"
               attempt=$((attempt+1))
               sleep 2
             fi
           done
-          echo "codesign failed after $max_attempts attempts: $target"
+
+          echo "❌ codesign failed after $max_attempts attempts: $target"
           return 1
         }
 
-        product_path="${{ inputs.product_path }}"
-
-        # 1) Signature des exécutables et dylib internes
+        echo "🔹 Signature des binaires et dylibs internes..."
+        # 1) Signer tous les exécutables et dylibs dans le produit
         while IFS= read -r -d '' file; do
-          retry_codesign "$file" "--timestamp" || exit 1
-        done < <(find "${product_path}" -type f \( -perm -111 -o -name "*.dylib" \) -print0)
+          retry_codesign "$file" "--timestamp"
+        done < <(find "$PRODUCT_PATH" -type f \( -perm -111 -o -name "*.dylib" \) -print0)
 
-        # 2) Signature des bundles .4dbase et .4darchive
+        echo "🔹 Signature des bundles .4darchive..."
+        # 2) Signer uniquement les bundles .4darchive
         while IFS= read -r -d '' bundle; do
           echo "=== Traitement du bundle : $bundle ==="
 
-          # 2.1) Signature de tous les binaires/dylib internes
+          # 2.1) Signer tous les binaires/dylibs internes au bundle
           while IFS= read -r -d '' inner; do
-            retry_codesign "$inner" "--timestamp" || exit 1
+            retry_codesign "$inner" "--timestamp"
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" \) -print0)
 
-          # 2.2) Signature du bundle lui-même uniquement si c'est un .4darchive
-          if [[ "$bundle" == *.4darchive ]]; then
-            retry_codesign "$bundle" "--timestamp" || exit 1
-          fi
+          # 2.2) Signer le bundle .4darchive lui-même
+          retry_codesign "$bundle" "--timestamp"
 
-        done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
+        done < <(find "$PRODUCT_PATH" -type d -name "*.4darchive" -print0)
 
-        # 3) Signature finale de l’app principale
-        if [ -d "${product_path}" ]; then
-          retry_codesign "${product_path}" "--deep --timestamp" || exit 1
-        fi
+        echo "✅ Codesign terminé avec succès."
 
       env:
         sign: ${{ inputs.sign }}
