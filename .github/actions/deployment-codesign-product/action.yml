@@ -134,7 +134,7 @@ runs:
           local attempt=1
           local max_attempts=3
           until [ $attempt -gt $max_attempts ]; do
-            if codesign --force --options runtime --sign "$CERTIFICATE" $opts "$target"; then
+            if codesign --force --options runtime --sign "${{ inputs.sign }}" $opts "$target"; then
               return 0
             else
               echo "codesign failed on $target (attempt $attempt)"
