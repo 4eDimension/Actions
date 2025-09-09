@@ -128,85 +128,137 @@ runs:
       run: |
         set -euo pipefail
 
-        sign="${{ inputs.sign }}"
-        product_path="${{ inputs.product_path }}"
-        entitlements_path="${{ steps.setup.outputs.entitlements_path }}"
-
-        echo "📦 Starting codesign for: $product_path"
-
-        # Fonction utilitaire pour signer avec retry
         retry_codesign() {
           local target="$1"
+          local timestamp_flag="$2"
           local attempt=1
-          local max_attempts=3
+          local max_attempts=5
           local delay=5
           while [ $attempt -le $max_attempts ]; do
-            echo "[$attempt/$max_attempts] Signing: $target"
-            codesign --options runtime --timestamp --force --sign "$sign" --entitlements "$entitlements_path" "$target" 2>&1
+            echo "[$attempt/$max_attempts] codesign de: $target"
+            output=$(codesign --verbose --deep --strict --options=runtime $timestamp_flag \
+              --force --sign "${sign}" --keychain "${keychain}" \
+              --entitlements "${entitlements_path}" "$target" 2>&1)
             status=$?
+            echo "$output"
             if [ $status -eq 0 ]; then
-              echo "✅ Signed: $target"
+              echo "✅ codesign réussi pour $target"
               return 0
             fi
-            echo "⚠️ Attempt $attempt failed for $target, retrying in $delay s..."
+            if echo "$output" | grep -qiE "no identity found|password|resource fork|invalid|not found in keychain|code object is not signed at all"; then
+              echo "❌ Erreur fatale détectée, arrêt immédiat."
+              return 1
+            fi
+            echo "⚠️ Tentative $attempt échouée, nouvelle tentative dans ${delay}s..."
+            attempt=$(( attempt + 1 ))
             sleep $delay
-            attempt=$((attempt + 1))
             delay=$(( delay * 2 ))
           done
-          echo "❌ Failed to sign $target after $max_attempts attempts"
+          echo "❌ Échec après $max_attempts tentatives pour $target"
           return 1
         }
 
-        # === Étape 1 : Signer tous les binaires et frameworks internes avant de signer le conteneur ===
+        echo "=== Signing main product: ${product_path} ==="
+
+        # Étape 1 : Signer tous les binaires, frameworks, apps, plugins, kexts hors .4dbase/.4darchive
+        while IFS= read -r -d '' item; do
+          retry_codesign "$item" "--timestamp" || exit 1
+        done < <(
+          find "${product_path}" \
+            \( -type f -perm -111 -o -name "*.dylib" -o -name "*.so" \
+              -o -type d -name "*.framework" -o -type d -name "*.bundle" \
+              -o -type d -name "*.plugin" -o -type d -name "*.kext" -o -type d -name "*.app" \) \
+            ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
+        )
+
+        # Étape 2 : Signer le contenu interne des .4dbase et .4darchive
         while IFS= read -r -d '' bundle; do
           echo "📂 Signing internal contents of $bundle"
 
-          # 1) Exécutables et libs
-          while IFS= read -r -d '' exe; do
-            retry_codesign "$exe"
-          done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 | sort -z)
+          # 1) Exécutables simples et libs (.dylib, .so, exécutables)
+          while IFS= read -r -d '' f; do
+            echo "🔧 Signing file: $f"
+            retry_codesign "$f" "--timestamp" || exit 1
+          done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
-          # 2) Frameworks
+          # 2) Frameworks internes
           while IFS= read -r -d '' fw; do
-            fwbin="$fw/Versions/A/$(basename "$fw" .framework)"
-            if [ ! -f "$fwbin" ]; then
-              fwbin="$fw/Versions/Current/$(basename "$fw" .framework)"
-            fi
-            retry_codesign "$fwbin"
-            retry_codesign "$fw"
-          done < <(find "$bundle" -type d -name "*.framework" -print0 | sort -z)
+            echo "📘 Framework: $fw"
+            fwname="$(basename "$fw" .framework)"
 
-          # 3) Internal apps
+            # Binaire interne habituel
+            candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
+            found=""
+            for c in "${candidates[@]}"; do
+              if [ -f "$c" ]; then
+                found="$c"
+                break
+              fi
+            done
+
+            if [ -z "$found" ]; then
+              found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
+            fi
+
+            if [ -n "$found" ]; then
+              echo "🔧 Signing framework binary: $found"
+              retry_codesign "$found" "--timestamp" || exit 1
+            fi
+
+            # Signer tous les dylibs internes
+            while IFS= read -r -d '' dylib; do
+              retry_codesign "$dylib" "--timestamp" || exit 1
+            done < <(find "$fw" -type f -name "*.dylib" -print0)
+
+            # Signer le framework lui-même
+            retry_codesign "$fw" "--timestamp" || exit 1
+          done < <(find "$bundle" -type d -name "*.framework" -print0)
+
+          # 3) Applications internes
           while IFS= read -r -d '' app; do
+            echo "📦 Internal .app: $app"
             mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
             if [ -f "$mainexe" ]; then
-              retry_codesign "$mainexe"
+              retry_codesign "$mainexe" "--timestamp" || exit 1
+            else
+              exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
+              if [ -n "$exe" ]; then
+                retry_codesign "$exe" "--timestamp" || exit 1
+              fi
             fi
-            retry_codesign "$app"
-          done < <(find "$bundle" -type d -name "*.app" -print0 | sort -z)
 
-          # 4) Plugins / bundles / kext
+            while IFS= read -r -d '' dylib; do
+              retry_codesign "$dylib" "--timestamp" || exit 1
+            done < <(find "$app" -type f -name "*.dylib" -print0)
+
+            retry_codesign "$app" "--timestamp" || exit 1
+          done < <(find "$bundle" -type d -name "*.app" -print0)
+
+          # 4) Plugins, bundles, kexts internes
           while IFS= read -r -d '' bp; do
+            echo "🔌 Plugin/bundle/kext: $bp"
             exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
-            [ -n "$exe" ] && retry_codesign "$exe"
-            retry_codesign "$bp"
-          done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0 | sort -z)
+            if [ -n "$exe" ]; then
+              retry_codesign "$exe" "--timestamp" || exit 1
+            fi
+            retry_codesign "$bp" "--timestamp" || exit 1
+          done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
-          # 5) Signer le conteneur .4dbase / .4darchive
-          retry_codesign "$bundle"
+          # 5) Ne pas signer le conteneur lui-même
+          echo "ℹ️ Skip signing container: $bundle"
 
-        done < <(find "$product_path" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0 | sort -z)
+        done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0 | sort -z)
 
-        # === Étape 2 : Signer l’app principale si c’est un .app ===
-        if [[ "$product_path" == *.app ]]; then
-          echo "📦 Signing main app: $product_path"
-          retry_codesign "$product_path"
+        # Étape 3 : Signer l’app principale si applicable
+        if [[ "${product_path}" == *.app ]]; then
+          echo "📦 Signature finale de l’app principale : ${product_path}"
+          retry_codesign "${product_path}" "--timestamp" || exit 1
         else
-          echo "ℹ️ $product_path n’est pas un .app, skipping root signature."
+          echo "ℹ️ ${product_path} n’est pas un .app, pas de signature racine."
         fi
-
       env:
         sign: ${{ inputs.sign }}
+        keychain: ${{ inputs.keychain }}
         product_path: ${{ inputs.product_path }}
         entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
 
