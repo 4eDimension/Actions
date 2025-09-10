@@ -123,7 +123,7 @@ runs:
 
         echo "✅ OK — aucun symlink executable dans les helpers"
 
-    - name: 🔏 Codesign product
+    - name: Codesign
       shell: bash
       run: |
         echo "=== Codesign start ==="
@@ -148,13 +148,13 @@ runs:
         esac
         echo "📦 Type détecté: $product_type"
 
-        # Fonction pour signer
-        sign_item() {
+        # Fonction pour signer (internes → sans timestamp)
+        sign_item_internal() {
           local item="$1"
-          if [ "$product_type" = "app" ] && [ ! -z "$entitlements_path" ]; then
-            codesign --force --options runtime --timestamp --entitlements "$entitlements_path" --sign "$sign" "$item"
+          if [ "$product_type" = "app" ] && [ -n "$entitlements_path" ]; then
+            codesign --force --options runtime --entitlements "$entitlements_path" --sign "$sign" "$item"
           else
-            codesign --force --options runtime --timestamp --sign "$sign" "$item"
+            codesign --force --options runtime --sign "$sign" "$item"
           fi
         }
 
@@ -162,29 +162,42 @@ runs:
         # Binaries
         find "$product_path" \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) -type f | while read -r bin; do
           echo "   -> signing $bin"
-          sign_item "$bin"
+          sign_item_internal "$bin"
         done
         # Frameworks
         find "$product_path" -name "*.framework" -type d | while read -r fw; do
           bin="$fw/$(basename "$fw" .framework)"
-          [ -f "$bin" ] && sign_item "$bin"
+          [ -f "$bin" ] && sign_item_internal "$bin"
         done
         # Bundles/plugins/kexts
         find "$product_path" \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -type d | while read -r b; do
-          sign_item "$b"
+          sign_item_internal "$b"
         done
-        # Sub-applications (dans .app)
+        # Sub-applications
         if [ "$product_type" = "app" ]; then
           find "$product_path" -name "*.app" -type d ! -path "$product_path" | while read -r sa; do
             echo "   -> signing sub-app $sa"
-            sign_item "$sa"
+            sign_item_internal "$sa"
           done
         fi
 
-        # Final container sign (uniquement pour .app)
+        # Final container sign (.app) avec retry + timestamp
         if [ "$product_type" = "app" ]; then
-          echo "➡️ Final container sign (.app)..."
-          codesign --force --options runtime --timestamp --deep --sign "$sign" "$product_path"
+          echo "➡️ Final container sign (.app) with timestamp..."
+          for attempt in {1..10}; do
+            if codesign --force --options runtime --timestamp --entitlements "$entitlements_path" --sign "$sign" "$product_path"; then
+              echo "✅ Signature réussie (tentative $attempt)"
+              break
+            else
+              echo "⚠️ Tentative $attempt échouée → nouvelle tentative dans 3s..."
+              sleep 3
+            fi
+            if [ "$attempt" -eq 10 ]; then
+              echo "❌ Échec après 10 tentatives → abandon."
+              exit 1
+            fi
+          done
+
           echo "🔎 Verification..."
           codesign --verify --deep --strict --verbose=2 "$product_path"
         else
