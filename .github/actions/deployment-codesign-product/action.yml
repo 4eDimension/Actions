@@ -125,23 +125,24 @@ runs:
 
     - name: Codesign
       shell: bash
+      env:
+        sign: ${{ inputs.sign }}
+        keychain: ${{ inputs.keychain }}
+        product_path: ${{ inputs.product_path }}
+        entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
       run: |
         echo "=== Codesign start ==="
         echo "product_path=$product_path"
-        echo "sign identity='$MACOS_CERT_ID'"
-        echo "entitlements='$ENTITLEMENTS_PLIST'"
+        echo "sign identity='$sign'"
+        echo "entitlements='$entitlements_path'"
 
-        # Nettoyage du quarantine éventuel
+        # Nettoyage xattr
         echo "🧹 Nettoyage xattr (quarantine) sur le produit..."
         xattr -rc "$product_path" || true
 
-        echo "🔐 Keychain resolved: $KEYCHAIN_PATH"
-        if [ -n "$KEYCHAIN_PWD" ]; then
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" || true
-        else
-          echo "⚠️ No KEYCHAIN_PWD provided — trying best-effort unlock"
-          security unlock-keychain "$KEYCHAIN_PATH" || true
-        fi
+        # Keychain
+        echo "🔐 Keychain resolved: $keychain"
+        security unlock-keychain -u "$keychain" || true
 
         # Déterminer le type de conteneur
         case "$product_path" in
@@ -152,12 +153,16 @@ runs:
         esac
         echo "📦 Type détecté: $product_type"
 
-        # Fonction pour signer
+        # Fonction de signature
         sign_item() {
           local item="$1"
+          if [ ! -f "$entitlements_path" ] && [ "$product_type" = "app" ]; then
+            echo "❌ Missing entitlements file path: $entitlements_path"
+            exit 1
+          fi
           codesign --force --options runtime --timestamp \
-            --entitlements "$ENTITLEMENTS_PLIST" \
-            --sign "$MACOS_CERT_ID" "$item"
+            ${entitlements_path:+--entitlements "$entitlements_path"} \
+            --sign "$sign" "$item"
         }
 
         echo "➡️ Signing executables & libs..."
@@ -177,19 +182,13 @@ runs:
           sign_item "$b"
         done
 
-        # Conteneur final uniquement si .app
         if [ "$product_type" = "app" ]; then
           echo "➡️ Final container sign (.app)..."
           sign_item "$product_path"
-
           echo "🔎 Verification..."
           codesign --verify --deep --strict --verbose=2 "$product_path"
         else
           echo "ℹ️ Pas un .app → skip du container sign et de la vérification globale"
-          echo "🔎 Vérification des binaires signés..."
-          find "$product_path" \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) -type f | while read -r bin; do
-            codesign --verify --verbose=2 "$bin"
-          done
         fi
 
         echo "✅ Codesign terminé"
