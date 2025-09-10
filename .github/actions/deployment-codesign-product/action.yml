@@ -123,7 +123,7 @@ runs:
 
         echo "✅ OK — aucun symlink executable dans les helpers"
 
-    - name: Codesign
+    - name: 🔏 Codesign product
       shell: bash
       run: |
         echo "=== Codesign start ==="
@@ -135,55 +135,60 @@ runs:
         echo "🧹 Nettoyage xattr (quarantine) sur le produit..."
         xattr -rc "$product_path" || true
 
-        # Keychain
+        # Keychain unlock
         echo "🔐 Keychain resolved: $keychain"
-        security unlock-keychain -u "$keychain" || true
+        [ -n "$keychain" ] && security unlock-keychain -u "$keychain" || true
 
-        # Déterminer le type de conteneur
+        # Détection type produit
         case "$product_path" in
-          *.app)      product_type="app" ;;
-          *.4dbase)   product_type="4dbase" ;;
+          *.app)       product_type="app" ;;
+          *.4dbase)    product_type="4dbase" ;;
           *.4darchive) product_type="4darchive" ;;
-          *)          product_type="other" ;;
+          *)           product_type="other" ;;
         esac
         echo "📦 Type détecté: $product_type"
 
-        # Fonction de signature
+        # Fonction pour signer
         sign_item() {
           local item="$1"
-          if [ ! -f "$entitlements_path" ] && [ "$product_type" = "app" ]; then
-            echo "❌ Missing entitlements file path: $entitlements_path"
-            exit 1
+          if [ "$product_type" = "app" ] && [ ! -z "$entitlements_path" ]; then
+            codesign --force --options runtime --timestamp --entitlements "$entitlements_path" --sign "$sign" "$item"
+          else
+            codesign --force --options runtime --timestamp --sign "$sign" "$item"
           fi
-          codesign --force --options runtime --timestamp \
-            ${entitlements_path:+--entitlements "$entitlements_path"} \
-            --sign "$sign" "$item"
         }
 
-        echo "➡️ Signing executables & libs..."
+        echo "➡️ Signing all binaries, frameworks, bundles, sub-apps..."
+        # Binaries
         find "$product_path" \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) -type f | while read -r bin; do
           echo "   -> signing $bin"
           sign_item "$bin"
         done
-
-        echo "➡️ Signing frameworks..."
+        # Frameworks
         find "$product_path" -name "*.framework" -type d | while read -r fw; do
           bin="$fw/$(basename "$fw" .framework)"
           [ -f "$bin" ] && sign_item "$bin"
         done
-
-        echo "➡️ Signing bundles/plugins..."
+        # Bundles/plugins/kexts
         find "$product_path" \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -type d | while read -r b; do
           sign_item "$b"
         done
+        # Sub-applications (dans .app)
+        if [ "$product_type" = "app" ]; then
+          find "$product_path" -name "*.app" -type d ! -path "$product_path" | while read -r sa; do
+            echo "   -> signing sub-app $sa"
+            sign_item "$sa"
+          done
+        fi
 
+        # Final container sign (uniquement pour .app)
         if [ "$product_type" = "app" ]; then
           echo "➡️ Final container sign (.app)..."
-          sign_item "$product_path"
+          codesign --force --options runtime --timestamp --deep --sign "$sign" "$product_path"
           echo "🔎 Verification..."
           codesign --verify --deep --strict --verbose=2 "$product_path"
         else
-          echo "ℹ️ Pas un .app → skip du container sign et de la vérification globale"
+          echo "ℹ️ Pas un .app → skip final container sign"
         fi
 
         echo "✅ Codesign terminé"
