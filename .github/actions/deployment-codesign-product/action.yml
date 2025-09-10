@@ -131,80 +131,84 @@ runs:
         echo "sign identity='$sign'"
         echo "entitlements='$entitlements_path'"
 
-        # Nettoyage xattr
+        # Nettoyage des attributs xattr (quarantine, com.apple.FinderInfo, etc.)
         echo "🧹 Nettoyage xattr (quarantine) sur le produit..."
         xattr -rc "$product_path" || true
 
-        # Keychain unlock
         echo "🔐 Keychain resolved: $keychain"
-        [ -n "$keychain" ] && security unlock-keychain -u "$keychain" || true
+        if [ -n "$KEYCHAIN_PWD" ]; then
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$keychain"
+        else
+          echo "⚠️ No KEYCHAIN_PWD provided — trying best-effort unlock"
+          security unlock-keychain "$keychain" || true
+        fi
 
         # Détection type produit
-        case "$product_path" in
-          *.app)       product_type="app" ;;
-          *.4dbase)    product_type="4dbase" ;;
-          *.4darchive) product_type="4darchive" ;;
-          *)           product_type="other" ;;
-        esac
+        if [[ "$product_path" == *.app* ]]; then
+          product_type="app"
+        elif [[ "$product_path" == *.4dbase* ]]; then
+          product_type="4dbase"
+        elif [[ "$product_path" == *.4darchive* ]]; then
+          product_type="4darchive"
+        else
+          product_type="other"
+        fi
         echo "📦 Type détecté: $product_type"
 
-        # Fonction pour signer (internes → sans timestamp)
+        # Fonction de signature robuste avec retry + timestamp
         sign_item_internal() {
           local item="$1"
-          if [ "$product_type" = "app" ] && [ -n "$entitlements_path" ]; then
-            codesign --force --options runtime --entitlements "$entitlements_path" --sign "$sign" "$item"
-          else
-            codesign --force --options runtime --sign "$sign" "$item"
+          local extra_opts=("--force" "--options" "runtime")
+
+          # Ajout entitlements uniquement pour le container principal
+          if [[ "$item" == "$product_path" ]] && [ "$product_type" = "app" ] && [ -n "$entitlements_path" ]; then
+            extra_opts+=("--entitlements" "$entitlements_path")
           fi
+
+          for attempt in {1..10}; do
+            if codesign "${extra_opts[@]}" --timestamp --sign "$sign" "$item"; then
+              echo "✅ signed: $item (tentative $attempt)"
+              return 0
+            else
+              echo "⚠️ Signing failed for $item (tentative $attempt), retry dans 3s..."
+              sleep 3
+            fi
+          done
+
+          echo "❌ Échec de signature (avec timestamp) pour $item après 10 tentatives"
+          exit 1
         }
 
         echo "➡️ Signing all binaries, frameworks, bundles, sub-apps..."
-        # Binaries
-        find "$product_path" \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) -type f | while read -r bin; do
-          echo "   -> signing $bin"
+
+        # Libs et exécutables
+        find "$product_path" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) | while read -r bin; do
           sign_item_internal "$bin"
         done
+
         # Frameworks
-        find "$product_path" -name "*.framework" -type d | while read -r fw; do
-          bin="$fw/$(basename "$fw" .framework)"
-          [ -f "$bin" ] && sign_item_internal "$bin"
+        find "$product_path" -type d -name "*.framework" | while read -r fw; do
+          sign_item_internal "$fw"
         done
-        # Bundles/plugins/kexts
-        find "$product_path" \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -type d | while read -r b; do
-          sign_item_internal "$b"
+
+        # Bundles / plugins
+        find "$product_path" -type d -name "*.bundle" | while read -r bundle; do
+          sign_item_internal "$bundle"
         done
-        # Sub-applications
-        if [ "$product_type" = "app" ]; then
-          find "$product_path" -name "*.app" -type d ! -path "$product_path" | while read -r sa; do
-            echo "   -> signing sub-app $sa"
-            sign_item_internal "$sa"
-          done
-        fi
 
-        # Final container sign (.app) avec retry + timestamp
-        if [ "$product_type" = "app" ]; then
-          echo "➡️ Final container sign (.app) with timestamp..."
-          for attempt in {1..10}; do
-            if codesign --force --options runtime --timestamp --entitlements "$entitlements_path" --sign "$sign" "$product_path"; then
-              echo "✅ Signature réussie (tentative $attempt)"
-              break
-            else
-              echo "⚠️ Tentative $attempt échouée → nouvelle tentative dans 3s..."
-              sleep 3
-            fi
-            if [ "$attempt" -eq 10 ]; then
-              echo "❌ Échec après 10 tentatives → abandon."
-              exit 1
-            fi
-          done
+        # Sub-apps
+        find "$product_path" -type d -name "*.app" | while read -r subapp; do
+          if [ "$subapp" != "$product_path" ]; then
+            sign_item_internal "$subapp"
+          fi
+        done
 
-          echo "🔎 Verification..."
-          codesign --verify --deep --strict --verbose=2 "$product_path"
-        else
-          echo "ℹ️ Pas un .app → skip final container sign"
-        fi
+        # Container principal (app, 4dbase, 4darchive, etc.)
+        sign_item_internal "$product_path"
 
-        echo "✅ Codesign terminé"
+        echo "🔎 Verification..."
+        codesign --verify --deep --strict --verbose=2 "$product_path"
+        spctl --verbose=4 --assess --type execute "$product_path" || true
       env:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
