@@ -123,195 +123,76 @@ runs:
 
         echo "✅ OK — aucun symlink executable dans les helpers"
 
-    - name: Codesign (robuste, ordre correct, timestamp)
+    - name: Codesign
       shell: bash
       run: |
-        set -euo pipefail
         echo "=== Codesign start ==="
-        echo "product_path=${product_path}"
-        echo "sign identity='${sign}'"
-        echo "entitlements='${entitlements_path}'"
+        echo "product_path=$product_path"
+        echo "sign identity='$MACOS_CERT_ID'"
+        echo "entitlements='$ENTITLEMENTS_PLIST'"
 
-        # 0) nettoyage d'attributs (quarantine/xattr)
+        # Nettoyage du quarantine éventuel
         echo "🧹 Nettoyage xattr (quarantine) sur le produit..."
-        xattr -cr "${product_path}" || true
+        xattr -rc "$product_path" || true
 
-        # 1) résolution du keychain (si c'est un chemin ou un nom)
-        KC="${keychain}"
-        if [[ ! "${KC}" = /* && "${KC}" != *.keychain* ]]; then
-          if [ -f "${HOME}/Library/Keychains/${KC}.keychain-db" ]; then
-            KC="${HOME}/Library/Keychains/${KC}.keychain-db"
-          elif [ -f "${HOME}/Library/Keychains/${KC}" ]; then
-            KC="${HOME}/Library/Keychains/${KC}"
-          fi
-        fi
-        if [ -f "${KC}" ]; then
-          echo "🔐 Keychain resolved: ${KC}"
-          # attempt unlock / set partition list if KEYCHAIN_PWD exists in environment (optional)
-          if [ -n "${KEYCHAIN_PWD:-}" ]; then
-            echo "🔑 Unlocking keychain with provided KEYCHAIN_PWD"
-            security unlock-keychain -p "${KEYCHAIN_PWD}" "${KC}"
-            echo "🔧 Setting key partition list (allow codesign to use private key)"
-            security set-key-partition-list -S apple-tool:,apple: -s -k "${KEYCHAIN_PWD}" "${KC}" || true
-          else
-            echo "⚠️ No KEYCHAIN_PWD provided — trying to unlock keychain without password (best-effort)"
-            security unlock-keychain "${KC}" || true
-            # best-effort set-key-partition-list (may fail without password)
-            security set-key-partition-list -S apple-tool:,apple: -s "${KC}" >/dev/null 2>&1 || true
-          fi
-          KC_ARG=(--keychain "${KC}")
+        echo "🔐 Keychain resolved: $KEYCHAIN_PATH"
+        if [ -n "$KEYCHAIN_PWD" ]; then
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" || true
         else
-          echo "⚠️ Keychain file not found; codesign will use default keychains"
-          KC_ARG=()
+          echo "⚠️ No KEYCHAIN_PWD provided — trying best-effort unlock"
+          security unlock-keychain "$KEYCHAIN_PATH" || true
         fi
 
-        # 2) base options for codesign (no --deep here: sign components explicitly)
-        codesign_base=(codesign --force --options runtime --strict --timestamp --entitlements "${entitlements_path}" --sign "${sign}")
-        # if we resolved a keychain, add it to options
-        if [ "${#KC_ARG[@]}" -gt 0 ]; then
-          codesign_base+=("${KC_ARG[@]}")
-        fi
+        # Déterminer le type de conteneur
+        case "$product_path" in
+          *.app)      product_type="app" ;;
+          *.4dbase)   product_type="4dbase" ;;
+          *.4darchive) product_type="4darchive" ;;
+          *)          product_type="other" ;;
+        esac
+        echo "📦 Type détecté: $product_type"
 
-        # retry helper
-        retry_codesign() {
-          local target="$1"
-          local attempt=1
-          local max_attempts=4
-          local delay=3
-          until [ $attempt -gt $max_attempts ]; do
-            echo "[attempt $attempt/$max_attempts] codesign -> $target"
-            if "${codesign_base[@]}" "$target" 2>&1; then
-              echo "✅ signed: $target"
-              return 0
-            fi
-            echo "⚠️ codesign failed for $target — retry in ${delay}s..."
-            sleep $delay
-            attempt=$((attempt+1))
-            delay=$((delay*2))
-          done
-          echo "❌ codesign permanently failed for $target"
-          return 1
+        # Fonction pour signer
+        sign_item() {
+          local item="$1"
+          codesign --force --options runtime --timestamp \
+            --entitlements "$ENTITLEMENTS_PLIST" \
+            --sign "$MACOS_CERT_ID" "$item"
         }
 
-        # 3) Sign executables & libs outside .4dbase/.4darchive
-        echo "➡️ Signing executables & libs (hors .4dbase/.4darchive)..."
-        while IFS= read -r -d '' f; do
-          retry_codesign "$f" || exit 1
-        done < <(find "${product_path}" \( -type f -perm -111 -o -name '*.dylib' -o -name '*.so' \) ! -path '*/.4dbase/*' ! -path '*/.4darchive/*' -print0)
+        echo "➡️ Signing executables & libs..."
+        find "$product_path" \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) -type f | while read -r bin; do
+          echo "   -> signing $bin"
+          sign_item "$bin"
+        done
 
-        # 4) Sign frameworks (binary inside first) outside .4dbase/.4darchive
-        echo "➡️ Signing frameworks (binary inside -> framework)..."
-        while IFS= read -r -d '' fw; do
-          echo " - framework: $fw"
-          fwname="$(basename "$fw" .framework)"
-          candidates=( "$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname" )
-          found=""
-          for c in "${candidates[@]}"; do
-            [ -f "$c" ] && { found="$c"; break; }
-          done
-          if [ -z "$found" ]; then
-            found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
-          fi
-          if [ -n "$found" ]; then
-            retry_codesign "$found" || exit 1
-          fi
-          retry_codesign "$fw" || exit 1
-        done < <(find "${product_path}" -type d -name '*.framework' ! -path '*/.4dbase/*' ! -path '*/.4darchive/*' -print0)
+        echo "➡️ Signing frameworks..."
+        find "$product_path" -name "*.framework" -type d | while read -r fw; do
+          bin="$fw/$(basename "$fw" .framework)"
+          [ -f "$bin" ] && sign_item "$bin"
+        done
 
-        # 5) Sign bundles/plugins/kexts outside .4dbase/.4darchive
-        echo "➡️ Signing bundles/plugins/kexts..."
-        while IFS= read -r -d '' bp; do
-          echo " - bundle: $bp"
-          exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
-          [ -n "$exe" ] && retry_codesign "$exe" || true
-          retry_codesign "$bp" || exit 1
-        done < <(find "${product_path}" -type d \( -name '*.bundle' -o -name '*.plugin' -o -name '*.kext' \) ! -path '*/.4dbase/*' ! -path '*/.4darchive/*' -print0)
+        echo "➡️ Signing bundles/plugins..."
+        find "$product_path" \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -type d | while read -r b; do
+          sign_item "$b"
+        done
 
-        # 6) Sign nested .app helpers (outside .4dbase/.4darchive)
-        echo "➡️ Signing nested .app helpers..."
-        while IFS= read -r -d '' app; do
-          echo " - helper app: $app"
-          mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
-          if [ -f "$mainexe" ]; then
-            retry_codesign "$mainexe" || exit 1
-          else
-            exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
-            [ -n "$exe" ] && retry_codesign "$exe" || true
-          fi
-          # sign dylibs inside app
-          while IFS= read -r -d '' dylib; do
-            retry_codesign "$dylib" || exit 1
-          done < <(find "$app" -type f -name '*.dylib' -print0)
-          retry_codesign "$app" || exit 1
-        done < <(find "${product_path}" -type d -name '*.app' ! -path '*/.4dbase/*' ! -path '*/.4darchive/*' -print0)
+        # Conteneur final uniquement si .app
+        if [ "$product_type" = "app" ]; then
+          echo "➡️ Final container sign (.app)..."
+          sign_item "$product_path"
 
-        # 7) Special: sign internals of .4dbase and .4darchive (but DO NOT sign the container)
-        echo "➡️ Signing internals of .4dbase and .4darchive (container SKIPPED)..."
-        while IFS= read -r -d '' bundle; do
-          echo " - container: $bundle"
-          # executables/libs in container
-          while IFS= read -r -d '' f; do
-            retry_codesign "$f" || exit 1
-          done < <(find "$bundle" -type f \( -perm -111 -o -name '*.dylib' -o -name '*.so' \) -print0)
-
-          # frameworks inside
-          while IFS= read -r -d '' fw; do
-            echo "   - internal framework: $fw"
-            fwname="$(basename "$fw" .framework)"
-            candidates=( "$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname" )
-            found=""
-            for c in "${candidates[@]}"; do [ -f "$c" ] && { found="$c"; break; } done
-            if [ -z "$found" ]; then
-              found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
-            fi
-            [ -n "$found" ] && retry_codesign "$found" || true
-            retry_codesign "$fw" || exit 1
-          done < <(find "$bundle" -type d -name '*.framework' -print0)
-
-          # internal apps
-          while IFS= read -r -d '' app; do
-            echo "   - internal app: $app"
-            mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
-            [ -f "$mainexe" ] && retry_codesign "$mainexe" || true
-            retry_codesign "$app" || exit 1
-          done < <(find "$bundle" -type d -name '*.app' -print0)
-
-          # plugins/bundles/kexts inside
-          while IFS= read -r -d '' bp; do
-            exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
-            [ -n "$exe" ] && retry_codesign "$exe" || true
-            retry_codesign "$bp" || exit 1
-          done < <(find "$bundle" -type d \( -name '*.bundle' -o -name '*.plugin' -o -name '*.kext' \) -print0)
-
-          echo "   -> done container: $bundle"
-        done < <(find "${product_path}" -type d \( -name '*.4dbase' -o -name '*.4darchive' \) -print0 | sort -z)
-
-        # 8) Final sign of top-level .app (if product_path is .app)
-        if [[ "${product_path}" == *.app ]]; then
-          echo "➡️ Final top-level app signature: ${product_path}"
-          retry_codesign "${product_path}" || { echo "❌ Final signature failed"; exit 1; }
+          echo "🔎 Verification..."
+          codesign --verify --deep --strict --verbose=2 "$product_path"
         else
-          echo "ℹ️ product_path is not a .app — skipping final container sign"
+          echo "ℹ️ Pas un .app → skip du container sign et de la vérification globale"
+          echo "🔎 Vérification des binaires signés..."
+          find "$product_path" \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) -type f | while read -r bin; do
+            codesign --verify --verbose=2 "$bin"
+          done
         fi
 
-        # 9) Verification
-        echo "🔎 Post-sign verification (codesign --verify)"
-        if ! codesign --verify --deep --strict --verbose=4 "${product_path}"; then
-          echo "❌ codesign verification FAILED for ${product_path}"
-          echo "→ run 'codesign -dvvv <path>' locally to inspect"
-          exit 1
-        fi
-
-        echo "📄 Signature details:"
-        codesign -dvvv "${product_path}" || true
-
-        # spctl check (warn only; useful for Gatekeeper validation)
-        if command -v spctl >/dev/null 2>&1; then
-          echo "🔐 spctl assessment (warning if it fails)"
-          spctl -a -t exec -vv "${product_path}" || echo "⚠️ spctl check failed (non-fatal here)"
-        fi
-
-        echo "✅ Codesign finished successfully for ${product_path}"
+        echo "✅ Codesign terminé"
       env:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
