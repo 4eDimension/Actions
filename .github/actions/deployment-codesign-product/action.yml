@@ -125,11 +125,6 @@ runs:
 
     - name: Codesign
       shell: bash
-      env:
-        sign: ${{ inputs.sign }}
-        keychain: ${{ inputs.keychain }}
-        product_path: ${{ inputs.product_path }}
-        entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
       run: |
         echo "=== Codesign start ==="
         echo "product_path=$product_path"
