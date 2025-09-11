@@ -123,94 +123,276 @@ runs:
 
         echo "✅ OK — aucun symlink executable dans les helpers"
 
-    - name: Codesign
+    - name: Codesign (résolution symlinks + timestamp + retries)
       shell: bash
       run: |
+        set -euo pipefail
         echo "=== Codesign start ==="
         echo "product_path=${product_path}"
-        echo "sign identity='${sign}'"
-        echo "entitlements='${entitlements_path}'"
+        echo "sign='${sign}'"
+        echo "entitlements='${entitlements_path:-}'"
 
-        # Nettoyage quarantine xattr
-        echo "🧹 Nettoyage xattr (quarantine)..."
-        find "${product_path}" -exec xattr -d com.apple.quarantine {} \; 2>/dev/null || true
+        # nettoyage xattr (quarantine) - best-effort
+        echo "🧹 Nettoyage xattr (quarantine) sur ${product_path}..."
+        xattr -rc "${product_path}" 2>/dev/null || true
 
-        # Détection du type de bundle
-        type_detected="other"
-        if [[ "${product_path}" == *.app ]]; then
-          type_detected="app"
-        elif [[ "${product_path}" == *.4dbase ]]; then
-          type_detected="4dbase"
-        elif [[ "${product_path}" == *.4darchive ]]; then
-          type_detected="4darchive"
+        # unlock keychain (best-effort) ; si tu as KEYCHAIN_PWD dans le job, mets-le
+        if [[ -n "${keychain:-}" ]]; then
+          if [[ -n "${KEYCHAIN_PWD:-}" ]]; then
+            echo "🔐 Unlock keychain (with password) : ${keychain}"
+            security unlock-keychain -p "${KEYCHAIN_PWD}" "${keychain}" || true
+            security set-key-partition-list -S apple-tool:,apple: -s -k "${KEYCHAIN_PWD}" "${keychain}" >/dev/null 2>&1 || true
+          else
+            echo "🔐 Unlock keychain (best-effort no password) : ${keychain}"
+            security unlock-keychain -u "${keychain}" >/dev/null 2>&1 || true
+          fi
+        else
+          echo "⚠️ No keychain provided, using default keychains"
         fi
-        echo "📦 Type détecté: ${type_detected}"
 
-        # Fonction de signature avec retry et timestamp
+        # produit type detection
+        if [[ "${product_path}" == *.app ]]; then
+          product_type="app"
+        elif [[ "${product_path}" == *.4dbase ]]; then
+          product_type="4dbase"
+        elif [[ "${product_path}" == *.4darchive ]]; then
+          product_type="4darchive"
+        else
+          product_type="other"
+        fi
+        echo "📦 Type détecté: ${product_type}"
+
+        # helper: detect fatal error in codesign output
+        is_fatal_output() {
+          local o="$1"
+          if printf "%s" "$o" | grep -qiE "no identity found|not found in keychain|password|keychain|code object is not signed at all|resource fork|invalid|not allowed|permission denied"; then
+            return 0
+          fi
+          return 1
+        }
+
+        # helper: resolve symlink path to absolute target and replace symlink by a copy (ditto)
+        resolve_and_replace_symlink() {
+          local path="$1"
+          if [ -L "$path" ]; then
+            echo "🔗 Found symlink -> resolving and replacing: $path"
+            TGT="$(readlink "$path")" || TGT=""
+            if [ -z "$TGT" ]; then
+              echo "⚠️ readlink returned empty for $path"
+              return 0
+            fi
+            # Resolve relative target to absolute using python if available
+            if command -v python3 >/dev/null 2>&1; then
+              RESOLVED=$(python3 - <<PY - "$path" "$TGT"
+    import os,sys
+    base=os.path.dirname(sys.argv[1])
+    tgt=sys.argv[2]
+    print(os.path.abspath(os.path.join(base,tgt)))
+    PY
+    )
+            elif command -v python >/dev/null 2>&1; then
+              RESOLVED=$(python - <<PY - "$path" "$TGT"
+    import os,sys
+    base=os.path.dirname(sys.argv[1])
+    tgt=sys.argv[2]
+    print(os.path.abspath(os.path.join(base,tgt)))
+    PY
+    )
+            else
+              # fallback: attempt join
+              RESOLVED="$(cd "$(dirname "$path")" && echo "$(pwd)/$TGT")"
+            fi
+
+            if [ -f "$RESOLVED" ]; then
+              echo "  -> resolving to $RESOLVED ; copying into place..."
+              rm -f "$path"
+              /usr/bin/ditto "$RESOLVED" "$path"
+              chmod +x "$path" || true
+              echo "  -> replaced symlink with real file"
+            else
+              echo "⚠️ Résolution cible introuvable: ${RESOLVED} (le symlink reste non modifié)"
+            fi
+          fi
+        }
+
+        # function: sign with timestamp + retry (10 attempts, 3s wait)
         sign_with_timestamp_retry() {
           local item="$1"
-          local ent_opt=()  # <- correction pour bash unbound variable
+          # entitlements only used when signing top-level .app and file exists
+          local ent_opt=()
           if [[ "${item}" == *.app ]] && [[ -n "${entitlements_path:-}" ]] && [[ -f "${entitlements_path}" ]]; then
             ent_opt=(--entitlements "${entitlements_path}")
           fi
 
           local attempt=1
           local max_attempts=10
-          local status=0
           while [ $attempt -le $max_attempts ]; do
-            echo "[sign attempt ${attempt}/${max_attempts}] codesign ${item}"
+            echo "[sign attempt ${attempt}/${max_attempts}] codesign -> ${item}"
+            # run codesign and capture output
             output=$(codesign --force --options runtime --strict --timestamp "${ent_opt[@]}" --sign "${sign}" "${item}" 2>&1) || status=$?
             status=${status:-0}
-            if [ $status -eq 0 ]; then
-              echo "✅ signed: ${item} (tentative ${attempt})"
+            if [ "$status" -eq 0 ]; then
+              echo "✅ signed: ${item} (attempt ${attempt})"
+              # verify immediately and dump details for logs
+              codesign --verify --strict --verbose=2 "${item}" 2>&1 || echo "⚠️ verification warning for ${item}"
+              echo "---- codesign -dvvv ${item} ----"
+              codesign -dvvv "${item}" 2>&1 || true
+              echo "---------------------------------"
               return 0
-            else
-              echo "⛔ codesign returned non-zero for ${item} (attempt ${attempt}). Output:"
-              echo "${output}"
-              echo "⚠️ Tentative ${attempt} échouée pour ${item}, retry dans 3s..."
-              sleep 3
-              ((attempt++))
             fi
+
+            echo "⛔ codesign non-zero for ${item} (attempt ${attempt}). Output:"
+            echo "${output}"
+            if is_fatal_output "${output}"; then
+              echo "❌ Erreur fatale détectée lors de la signature de ${item} -> abort."
+              echo "---- DEBUG codesign -dvvv ${item} (post-fatal) ----"
+              codesign -dvvv "${item}" 2>&1 || true
+              echo "--------------------------------------------------"
+              exit 1
+            fi
+
+            # If timestamp server errors => retry
+            if printf "%s" "$output" | grep -qiE "timestamp service is not available|unable to get timestamp|no connection|timed out"; then
+              echo "⚠️ TSA inaccessible pour ${item} — attente 3s puis nouvelle tentative..."
+              sleep 3
+              attempt=$((attempt+1))
+              continue
+            fi
+
+            # generic retry with small backoff
+            echo "⚠️ Tentative ${attempt} échouée pour ${item}, retry dans 3s..."
+            sleep 3
+            attempt=$((attempt+1))
           done
+
           echo "❌ Échec après ${max_attempts} tentatives pour ${item}"
           return 1
         }
 
-        # Parcours des binaires à signer
-        echo "➡️ Signature des exécutables (.dylib, .so, executables)..."
-        find "${product_path}" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) | while read -r bin; do
-          sign_with_timestamp_retry "$bin"
+        # function to sign framework: sign internal binary first then framework
+        sign_framework() {
+          local fw="$1"
+          echo "🔧 framework: ${fw}"
+          # resolve symlink if framework binary itself is symlink (rare)
+          local name="$(basename "$fw" .framework)"
+          local candidates=( "$fw/Versions/A/$name" "$fw/Versions/Current/$name" "$fw/$name" )
+          local found=""
+          for c in "${candidates[@]}"; do
+            if [ -f "$c" ]; then found="$c"; break; fi
+          done
+          if [ -z "$found" ]; then
+            found=$(find "$fw" -type f -perm +111 -maxdepth 3 -print -quit || true)
+          fi
+          if [ -n "$found" ]; then
+            resolve_and_replace_symlink "$found" || true
+            sign_with_timestamp_retry "$found" || return 1
+          fi
+          sign_with_timestamp_retry "$fw" || return 1
+        }
+
+        # function to sign bundle/plugin/kext: sign its executable(s) then the bundle
+        sign_bundle_like() {
+          local b="$1"
+          echo "🔌 bundle/plugin/kext: ${b}"
+          # sign executables in Contents/MacOS first
+          if [ -d "${b}/Contents/MacOS" ]; then
+            find "${b}/Contents/MacOS" -type f -perm +111 -print0 | while IFS= read -r -d '' exe; do
+              resolve_and_replace_symlink "$exe" || true
+              sign_with_timestamp_retry "$exe" || return 1
+            done
+          else
+            # fallback: first executable found
+            exe=$(find "$b" -type f -perm +111 -maxdepth 6 -print -quit || true)
+            if [ -n "$exe" ]; then
+              resolve_and_replace_symlink "$exe" || true
+              sign_with_timestamp_retry "$exe" || return 1
+            fi
+          fi
+          sign_with_timestamp_retry "$b" || return 1
+        }
+
+        # --- MAIN: sign everything useful inside product_path -- careful with null-bytes / spaces
+        echo "➡️ Signature des exécutables (.dylib .so, exes) dans ${product_path}..."
+        find "${product_path}" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) -print0 |
+        while IFS= read -r -d '' f; do
+          resolve_and_replace_symlink "$f" || true
+          sign_with_timestamp_retry "$f" || exit 1
         done
 
-        # Sign frameworks
         echo "➡️ Signature des frameworks..."
-        find "${product_path}" -type d -name "*.framework" | while read -r fw; do
-          sign_with_timestamp_retry "$fw"
+        find "${product_path}" -type d -name "*.framework" -print0 |
+        while IFS= read -r -d '' fw; do
+          sign_framework "$fw" || exit 1
         done
 
-        # Sign bundles/plugins/kexts
         echo "➡️ Signature des bundles/plugins/kexts..."
-        find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) | while read -r bundle; do
-          sign_with_timestamp_retry "$bundle"
+        find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0 |
+        while IFS= read -r -d '' b; do
+          sign_bundle_like "$b" || exit 1
         done
 
-        # Sign nested .app helpers inside .4dbase/.4darchive
-        echo "➡️ Signature des sub-apps et helpers..."
-        find "${product_path}" -type d -name "*.app" | while read -r subapp; do
-          sign_with_timestamp_retry "$subapp"
+        echo "➡️ Signature des sub-apps (helpers) trouvées..."
+        find "${product_path}" -type d -name "*.app" -print0 |
+        while IFS= read -r -d '' sa; do
+          # skip top-level if it's the top-level app (we'll sign it later)
+          if [[ "${product_type}" == "app" && "$(realpath "$sa")" == "$(realpath "$product_path")" ]]; then
+            continue
+          fi
+          echo "  -> sub-app: ${sa}"
+          # sign internals first
+          find "$sa" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) -print0 | while IFS= read -r -d '' sf; do
+            resolve_and_replace_symlink "$sf" || true
+            sign_with_timestamp_retry "$sf" || exit 1
+          done
+          find "$sa" -type d -name "*.framework" -print0 | while IFS= read -r -d '' sfw; do
+            sign_framework "$sfw" || exit 1
+          done
+          find "$sa" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0 | while IFS= read -r -d '' sb; do
+            sign_bundle_like "$sb" || exit 1
+          done
+          # final sign of subapp
+          sign_with_timestamp_retry "$sa" || exit 1
         done
 
-        # Sign the main container if it is a .app
-        if [[ "${product_path}" == *.app ]]; then
-          echo "➡️ Final container sign (.app)..."
-          sign_with_timestamp_retry "${product_path}"
+        # Final: sign top-level .app (with --deep) OR skip container for .4dbase/.4darchive
+        if [[ "${product_type}" == "app" ]]; then
+          echo "➡️ Final: signing top-level .app with --deep + timestamp (retry)..."
+          attempt=1
+          max_attempts=10
+          while [ $attempt -le $max_attempts ]; do
+            echo "[final sign attempt ${attempt}/${max_attempts}] codesign --deep ${product_path}"
+            out=$(codesign --force --options runtime --strict --deep --timestamp --entitlements "${entitlements_path:-}" --sign "${sign}" "${product_path}" 2>&1) || status=$?
+            status=${status:-0}
+            if [ "$status" = "0" ]; then
+              echo "✅ Final .app signed"
+              break
+            fi
+            echo "⛔ Final sign failed (attempt ${attempt}), output:"
+            echo "${out}"
+            if is_fatal_output "${out}"; then
+              echo "❌ Erreur fatale pendant final sign -> abort."
+              exit 1
+            fi
+            sleep 3
+            attempt=$((attempt+1))
+          done
+          if [ $attempt -gt $max_attempts ]; then
+            echo "❌ Échec final .app après ${max_attempts} tentatives"
+            exit 1
+          fi
+
+          echo "🔎 Vérification finale : codesign --verify --deep"
+          codesign --verify --deep --strict --verbose=2 "${product_path}" || { echo "❌ Verification finale échouée"; exit 1; }
         else
-          echo "ℹ️ product_path n'est pas un .app — skipping final container sign"
+          echo "ℹ️ Produit non .app (${product_type}) — container SKIPPED (c'est voulu pour .4dbase/.4darchive)."
+          echo "🔎 Vérification rapide des binaires signés..."
+          find "${product_path}" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +111 \) -print0 |
+          while IFS= read -r -d '' f; do
+            codesign --verify --verbose=2 "$f" || { echo "❌ Verification failed: $f"; exit 1; }
+          done
         fi
 
-        # Verification
-        echo "🔎 Vérification post-sign..."
-        codesign --verify --deep --strict --verbose=2 "${product_path}" || true
+        echo "✅ Codesign finished successfully for ${product_path}"
       env:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
