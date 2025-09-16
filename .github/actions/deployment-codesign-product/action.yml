@@ -146,7 +146,6 @@ runs:
               echo "✅ codesign succeeded: $target"
               return 0
             fi
-            # erreurs fatales -> abort
             if echo "$output" | grep -qiE "no identity found|password|resource fork|not found in keychain|code object is not signed at all"; then
               echo "❌ Fatal codesign error for $target"
               echo "$output"
@@ -212,7 +211,6 @@ runs:
           if codesign --remove-signature "$f" 2>/dev/null; then
             echo "🧹 old signature removed: $f"
           else
-            # ignore non-mach-o or not signed files
             true
           fi
         }
@@ -233,7 +231,7 @@ runs:
           verify_and_dump "$exe" || { echo "❌ Verification failed for leaf exe: $exe"; exit 1; }
         done < <(find "${product_path}" -type f -path "*/Contents/MacOS/*" -perm -111 ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0)
 
-        # === Étape B : signer libs et exécutables standards (dylib/so/exe) hors frameworks/apps/Contents/MacOS ===
+        # === Étape B : signer libs et exécutables standards ===
         echo "=== Étape B: Signing dylibs / .so / other executables ==="
         while IFS= read -r -d '' file; do
           echo "---- processing lib/exe: $file ----"
@@ -244,7 +242,7 @@ runs:
         done < <(find "${product_path}" -type f \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) \
                 ! -path "*.framework/*" ! -path "*.app/*" ! -path "*/Contents/MacOS/*" ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0)
 
-        # === Étape C : frameworks (signer le binaire interne, puis dylibs, puis le .framework) ===
+        # === Étape C : frameworks ===
         echo "=== Étape C: Signing frameworks ==="
         while IFS= read -r -d '' fw; do
           echo "📘 Framework: $fw"
@@ -266,19 +264,17 @@ runs:
             echo "⚠️ Aucun binaire exécutable trouvé dans $fw"
           fi
 
-          # sign dylibs inside framework
           while IFS= read -r -d '' dylib; do
             remove_sig "$dylib"
             retry_codesign "$dylib" "--timestamp" || { echo "❌ Failed signing dylib in fw: $dylib"; exit 1; }
             verify_and_dump "$dylib" || { echo "❌ Verification failed for dylib: $dylib"; exit 1; }
           done < <(find "$fw" -type f -name "*.dylib" -print0)
 
-          # sign the framework container (metadata)
           retry_codesign "$fw" "--timestamp" || { echo "❌ Failed signing framework container: $fw"; exit 1; }
           verify_and_dump "$fw" || { echo "❌ Verification failed for framework container: $fw"; exit 1; }
         done < <(find "${product_path}" -type d -name "*.framework" -print0)
 
-        # === Étape D : Bundles / plugins / kext -> signer leaf exe puis container ===
+        # === Étape D : Bundles / plugins / kext ===
         echo "=== Étape D: Signing bundles/plugins/kexts ==="
         while IFS= read -r -d '' bp; do
           echo "🔌 Plugin/Bundle/Kext: $bp"
@@ -293,7 +289,7 @@ runs:
           verify_and_dump "$bp" || { echo "❌ Verification failed for bundle container: $bp"; exit 1; }
         done < <(find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
-        # === Étape E : nested .app (internal apps) ===
+        # === Étape E : nested .app ===
         echo "=== Étape E: Signing nested .app bundles ==="
         while IFS= read -r -d '' app; do
           echo "📦 Internal app: $app"
@@ -312,25 +308,31 @@ runs:
             fi
           fi
 
-          # sign dylibs inside app
           while IFS= read -r -d '' dylib; do
             remove_sig "$dylib"
             retry_codesign "$dylib" "--timestamp" || { echo "❌ Failed signing dylib in app: $dylib"; exit 1; }
             verify_and_dump "$dylib" || { echo "❌ Verification failed for dylib in app: $dylib"; exit 1; }
           done < <(find "$app" -type f -name "*.dylib" -print0)
 
-          # sign the nested app container
           retry_codesign "$app" "--timestamp" || { echo "❌ Failed signing nested app container: $app"; exit 1; }
           verify_and_dump "$app" || { echo "❌ Verification failed for nested app container: $app"; exit 1; }
         done < <(find "${product_path}" -type d -name "*.app" -print0)
 
-        # === Étape F : Signature finale de l’app principale (avec entitlements si fournis) ===
+        # === Étape X : Sign critical dylibs in Libraries ===
+        echo "=== Étape X: Signing critical dylibs in Libraries ==="
+        while IFS= read -r -d '' lib; do
+          echo "🔧 Signing critical lib: $lib"
+          remove_sig "$lib"
+          retry_codesign "$lib" "--timestamp" || { echo "❌ Failed signing critical lib: $lib"; exit 1; }
+          verify_and_dump "$lib" || { echo "❌ Verification failed for critical lib: $lib"; exit 1; }
+        done < <(find "${product_path}/Libraries" -type f -name "*.dylib" -print0)
+
+        # === Étape F : Signature finale de l’app principale ===
         if [[ "${product_path}" == *.app ]]; then
           echo "=== Étape F: Final signing of top-level app (with entitlements if any) ==="
           if [[ -n "${entitlements_path-}" && -f "${entitlements_path}" ]]; then
             retry_codesign_with_entitlements "${product_path}" "--deep --timestamp" || { echo "❌ Final sign (with entitlements) failed"; exit 1; }
           else
-            # fallback: sign without entitlements if none provided
             retry_codesign "${product_path}" "--deep --timestamp" || { echo "❌ Final sign failed"; exit 1; }
           fi
 
@@ -341,7 +343,6 @@ runs:
             exit 1
           fi
 
-          # Optional: Gatekeeper check (spctl)
           if command -v spctl >/dev/null 2>&1; then
             echo "🔐 spctl check for gatekeeper:"
             spctl -a -vv --type execute "${product_path}" || true
