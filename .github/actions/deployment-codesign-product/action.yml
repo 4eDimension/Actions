@@ -221,23 +221,23 @@ runs:
         echo "product_path: ${product_path}"
         echo "entitlements_path: ${entitlements_path:-<none>}"
 
-        # === Étape A : signer les exécutables internes (Contents/MacOS/*) - leaf binaries ===
+        # === Étape A : signer les executables internes (Contents/MacOS/*) ===
         echo "=== Étape A: Signing executables in Contents/MacOS/ ==="
         while IFS= read -r -d '' exe; do
           echo "---- processing: $exe ----"
           remove_sig "$exe"
           lipo -info "$exe" 2>/dev/null || file "$exe" 2>/dev/null || true
-          retry_codesign "$exe" "--timestamp" || { echo "❌ Failed signing leaf exe: $exe"; exit 1; }
+          retry_codesign "$exe" "--deep --timestamp" || { echo "❌ Failed signing leaf exe: $exe"; exit 1; }
           verify_and_dump "$exe" || { echo "❌ Verification failed for leaf exe: $exe"; exit 1; }
         done < <(find "${product_path}" -type f -path "*/Contents/MacOS/*" -perm -111 ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0)
 
-        # === Étape B : signer libs et exécutables standards ===
+        # === Étape B : signer libs et executables standards ===
         echo "=== Étape B: Signing dylibs / .so / other executables ==="
         while IFS= read -r -d '' file; do
           echo "---- processing lib/exe: $file ----"
           remove_sig "$file"
           lipo -info "$file" 2>/dev/null || file "$file" 2>/dev/null || true
-          retry_codesign "$file" "--timestamp" || { echo "❌ Failed signing lib/exe: $file"; exit 1; }
+          retry_codesign "$file" "--deep --timestamp" || { echo "❌ Failed signing lib/exe: $file"; exit 1; }
           verify_and_dump "$file" || { echo "❌ Verification failed for lib/exe: $file"; exit 1; }
         done < <(find "${product_path}" -type f \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) \
                 ! -path "*.framework/*" ! -path "*.app/*" ! -path "*/Contents/MacOS/*" ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0)
@@ -258,7 +258,7 @@ runs:
           if [ -n "$found" ]; then
             echo "🔧 Signing inner framework binary: $found"
             remove_sig "$found"
-            retry_codesign "$found" "--timestamp" || { echo "❌ Failed signing framework inner: $found"; exit 1; }
+            retry_codesign "$found" "--deep --timestamp" || { echo "❌ Failed signing framework inner: $found"; exit 1; }
             verify_and_dump "$found" || { echo "❌ Verification failed for framework binary: $found"; exit 1; }
           else
             echo "⚠️ Aucun binaire exécutable trouvé dans $fw"
@@ -266,11 +266,11 @@ runs:
 
           while IFS= read -r -d '' dylib; do
             remove_sig "$dylib"
-            retry_codesign "$dylib" "--timestamp" || { echo "❌ Failed signing dylib in fw: $dylib"; exit 1; }
+            retry_codesign "$dylib" "--deep --timestamp" || { echo "❌ Failed signing dylib in fw: $dylib"; exit 1; }
             verify_and_dump "$dylib" || { echo "❌ Verification failed for dylib: $dylib"; exit 1; }
           done < <(find "$fw" -type f -name "*.dylib" -print0)
 
-          retry_codesign "$fw" "--timestamp" || { echo "❌ Failed signing framework container: $fw"; exit 1; }
+          retry_codesign "$fw" "--deep --timestamp" || { echo "❌ Failed signing framework container: $fw"; exit 1; }
           verify_and_dump "$fw" || { echo "❌ Verification failed for framework container: $fw"; exit 1; }
         done < <(find "${product_path}" -type d -name "*.framework" -print0)
 
@@ -282,10 +282,10 @@ runs:
           if [ -n "$exe" ]; then
             echo "🔧 signing inner exe: $exe"
             remove_sig "$exe"
-            retry_codesign "$exe" "--timestamp" || { echo "❌ Failed signing inner exe of bundle: $exe"; exit 1; }
+            retry_codesign "$exe" "--deep --timestamp" || { echo "❌ Failed signing inner exe of bundle: $exe"; exit 1; }
             verify_and_dump "$exe" || { echo "❌ Verification failed for inner exe of bundle: $exe"; exit 1; }
           fi
-          retry_codesign "$bp" "--timestamp" || { echo "❌ Failed signing bundle container: $bp"; exit 1; }
+          retry_codesign "$bp" "--deep --timestamp" || { echo "❌ Failed signing bundle container: $bp"; exit 1; }
           verify_and_dump "$bp" || { echo "❌ Verification failed for bundle container: $bp"; exit 1; }
         done < <(find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
@@ -297,35 +297,26 @@ runs:
           if [ -f "$mainexe" ]; then
             echo "🔧 main exe: $mainexe"
             remove_sig "$mainexe"
-            retry_codesign "$mainexe" "--timestamp" || { echo "❌ Failed signing nested main exe: $mainexe"; exit 1; }
+            retry_codesign "$mainexe" "--deep --timestamp" || { echo "❌ Failed signing nested main exe: $mainexe"; exit 1; }
             verify_and_dump "$mainexe" || { echo "❌ Verification failed for nested main exe: $mainexe"; exit 1; }
           else
             exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
             if [ -n "$exe" ]; then
               remove_sig "$exe"
-              retry_codesign "$exe" "--timestamp" || { echo "❌ Failed signing nested fallback exe: $exe"; exit 1; }
+              retry_codesign "$exe" "--deep --timestamp" || { echo "❌ Failed signing nested fallback exe: $exe"; exit 1; }
               verify_and_dump "$exe" || { echo "❌ Verification failed for nested fallback exe: $exe"; exit 1; }
             fi
           fi
 
           while IFS= read -r -d '' dylib; do
             remove_sig "$dylib"
-            retry_codesign "$dylib" "--timestamp" || { echo "❌ Failed signing dylib in app: $dylib"; exit 1; }
+            retry_codesign "$dylib" "--deep --timestamp" || { echo "❌ Failed signing dylib in app: $dylib"; exit 1; }
             verify_and_dump "$dylib" || { echo "❌ Verification failed for dylib in app: $dylib"; exit 1; }
           done < <(find "$app" -type f -name "*.dylib" -print0)
 
-          retry_codesign "$app" "--timestamp" || { echo "❌ Failed signing nested app container: $app"; exit 1; }
+          retry_codesign "$app" "--deep --timestamp" || { echo "❌ Failed signing nested app container: $app"; exit 1; }
           verify_and_dump "$app" || { echo "❌ Verification failed for nested app container: $app"; exit 1; }
         done < <(find "${product_path}" -type d -name "*.app" -print0)
-
-        # === Étape X : Sign critical dylibs in Libraries ===
-        echo "=== Étape X: Signing critical dylibs in Libraries ==="
-        while IFS= read -r -d '' lib; do
-          echo "🔧 Signing critical lib: $lib"
-          remove_sig "$lib"
-          retry_codesign "$lib" "--timestamp" || { echo "❌ Failed signing critical lib: $lib"; exit 1; }
-          verify_and_dump "$lib" || { echo "❌ Verification failed for critical lib: $lib"; exit 1; }
-        done < <(find "${product_path}/Libraries" -type f -name "*.dylib" -print0)
 
         # === Étape F : Signature finale de l’app principale ===
         if [[ "${product_path}" == *.app ]]; then
