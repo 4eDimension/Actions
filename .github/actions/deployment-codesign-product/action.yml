@@ -169,6 +169,16 @@ runs:
             ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
         )
 
+        # === Étape 1 bis : signer les exécutables internes des .bundle/.plugin (Contents/MacOS/*) ===
+        echo "=== Signing inner executables of bundles/plugins ==="
+        while IFS= read -r -d '' exe; do
+          echo "🔧 Signing inner bundle executable: $exe"
+          retry_codesign "$exe" "--timestamp" || exit 1
+        done < <(
+          find "${product_path}" -type f -path "*/Contents/MacOS/*" -perm -111 \
+            ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
+        )
+
         # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase) ===
         echo "=== Signing contents of .4dbase and .4darchive ==="
         while IFS= read -r -d '' bundle; do
@@ -180,12 +190,11 @@ runs:
             retry_codesign "$f" "--timestamp" || exit 1
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
-          # 2) Frameworks → signer le binaire interne (Versions/A ou Versions/Current), puis dylibs, puis le .framework
+          # 2) Frameworks
           while IFS= read -r -d '' fw; do
             echo "📘 Framework: $fw"
             fwname="$(basename "$fw" .framework)"
 
-            # Emplacements usuels
             candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
             found=""
             for c in "${candidates[@]}"; do
@@ -195,7 +204,6 @@ runs:
               fi
             done
 
-            # fallback → premier exécutable trouvé dans le framework
             if [ -z "$found" ]; then
               found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
             fi
@@ -207,17 +215,14 @@ runs:
               echo "⚠️ Aucun binaire exécutable trouvé dans $fw (on signera quand même le .framework)"
             fi
 
-            # signer les .dylib à l'intérieur du framework
             while IFS= read -r -d '' dylib; do
               retry_codesign "$dylib" "--timestamp" || exit 1
             done < <(find "$fw" -type f -name "*.dylib" -print0)
 
-            # signer le framework lui-même (metadata)
             retry_codesign "$fw" "--timestamp" || exit 1
-
           done < <(find "$bundle" -type d -name "*.framework" -print0)
 
-          # 3) Applications internes (.app) → signer executable principal, dylibs, puis le .app
+          # 3) Applications internes (.app)
           while IFS= read -r -d '' app; do
             echo "📦 Internal .app: $app"
             mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
@@ -237,7 +242,7 @@ runs:
             retry_codesign "$app" "--timestamp" || exit 1
           done < <(find "$bundle" -type d -name "*.app" -print0)
 
-          # 4) Bundles / plugins / kext → signer premier exe trouvé puis le conteneur
+          # 4) Bundles / plugins / kext
           while IFS= read -r -d '' bp; do
             echo "🔌 Plugin/bundle/kext: $bp"
             exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
