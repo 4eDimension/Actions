@@ -318,6 +318,18 @@ runs:
           verify_and_dump "$app" || { echo "❌ Verification failed for nested app container: $app"; exit 1; }
         done < <(find "${product_path}" -type d -name "*.app" -print0)
 
+        # === Étape X : SIGNER LES dylibs situés DANS LE REPERTOIRE DE STAGING (à côté de l'app) ===
+        echo "=== Étape X: Signing dylibs in staging dir (sibling of the .app) ==="
+        staging_dir="$(dirname "${product_path}")"
+        echo "Staging dir detected: ${staging_dir}"
+        # Sign all .dylib/.so under staging_dir but exclude files inside the .app itself
+        while IFS= read -r -d '' lib; do
+          echo "🔧 Signing staging lib: $lib"
+          remove_sig "$lib"
+          retry_codesign "$lib" "--deep --timestamp" || { echo "❌ Failed signing staging lib: $lib"; exit 1; }
+          verify_and_dump "$lib" || { echo "❌ Verification failed for staging lib: $lib"; exit 1; }
+        done < <(find "${staging_dir}" -type f \( -name "*.dylib" -o -name "*.so" \) ! -path "${product_path}/*" -print0 || true)
+
         # === Étape F : Signature finale de l’app principale ===
         if [[ "${product_path}" == *.app ]]; then
           echo "=== Étape F: Final signing of top-level app (with entitlements if any) ==="
