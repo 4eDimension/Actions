@@ -215,7 +215,7 @@ runs:
         # signe un binaire, gère universal/fat (thin per-arch -> sign -> lipo create -> resigner final)
         sign_file_handling_universal() {
           local file="$1"
-          local opts="$2"   # ex: "--timestamp" (NOTE: we avoid --deep here for thin/per-arch signing)
+          local opts="$2"   # ex: "--timestamp"
           if lipo -info "$file" 2>/dev/null | grep -q "Architectures in the fat file"; then
             echo "🔧 Detected universal binary, signing per-arch: $file"
             tmpdir=$(mktemp -d)
@@ -359,13 +359,47 @@ runs:
         echo "=== Étape D: Signing bundles/plugins/kexts ==="
         while IFS= read -r -d '' bp; do
           echo "🔌 Plugin/Bundle/Kext: $bp"
+
+          # --- SPECIAL CASE: WebViewerCEF.bundle
+          if [[ "$(basename "$bp")" == "WebViewerCEF.bundle" ]]; then
+            echo "⚠️ Special handling for WebViewerCEF.bundle -> sign helpers & CEF first"
+
+            # sign 4D Helper apps inside Frameworks (if any)
+            find "$bp/Contents/Frameworks" -type d -name "4D Helper*" -print0 2>/dev/null | while IFS= read -r -d '' helper_app; do
+              echo "   ↳ Signing helper app: $helper_app"
+              # sign nested frameworks/libs inside helper app first
+              while IFS= read -r -d '' hf; do
+                sign_file_handling_universal "$hf" "--timestamp" || { echo "❌ Failed signing helper inner: $hf"; exit 1; }
+              done < <(find "$helper_app" -type f \( -name "*.dylib" -o -perm -111 \) -print0 || true)
+              retry_codesign "$helper_app" "--timestamp" || { echo "❌ Failed signing helper app container: $helper_app"; exit 1; }
+              verify_and_dump "$helper_app" || { echo "❌ Verification failed for helper app: $helper_app"; exit 1; }
+            done || true
+
+            # sign Chromium Embedded Framework.framework inside bundle if present
+            if [ -d "$bp/Contents/Frameworks/Chromium Embedded Framework.framework" ]; then
+              echo "   ↳ Signing Chromium Embedded Framework.framework inside WebViewerCEF.bundle"
+              # sign inner dylibs and binaries
+              while IFS= read -r -d '' cefbin; do
+                sign_file_handling_universal "$cefbin" "--timestamp" || { echo "❌ Failed signing CEF inner: $cefbin"; exit 1; }
+              done < <(find "$bp/Contents/Frameworks/Chromium Embedded Framework.framework" -type f \( -name "*.dylib" -o -perm -111 \) -print0 || true)
+              retry_codesign "$bp/Contents/Frameworks/Chromium Embedded Framework.framework" "--timestamp" || { echo "❌ Failed signing CEF framework container"; exit 1; }
+              verify_and_dump "$bp/Contents/Frameworks/Chromium Embedded Framework.framework" || { echo "❌ Verification failed for CEF framework"; exit 1; }
+            fi
+          fi
+          # --- end special case
+
+          # sign inner executable if present
           exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
           if [ -n "$exe" ]; then
+            echo "🔧 signing inner exe: $exe"
             sign_file_handling_universal "$exe" "--timestamp" || { echo "❌ Failed signing inner exe of bundle: $exe"; exit 1; }
           fi
+
+          # sign nested dylibs inside bundle
           while IFS= read -r -d '' bpdylib; do
             sign_file_handling_universal "$bpdylib" "--timestamp" || { echo "❌ Failed signing bpdylib: $bpdylib"; exit 1; }
           done < <(find "$bp" -type f -name "*.dylib" -print0 || true)
+
           retry_codesign "$bp" "--timestamp" || { echo "❌ Failed signing bundle container: $bp"; exit 1; }
           verify_and_dump "$bp" || { echo "❌ Verification failed for bundle container: $bp"; exit 1; }
         done < <(find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0 || true)
@@ -425,7 +459,7 @@ runs:
         if [[ "${product_path}" == *.app ]]; then
           echo "=== Étape F: Final signing of top-level app (with entitlements if any) ==="
           if [[ -n "${entitlements_path-}" && -f "${entitlements_path}" ]]; then
-            # final sign avec entitlements MAIS sans --deep (on a déjà signé tout l'intérieur)
+            # final sign avec entitlements (sans --deep)
             retry_codesign_with_entitlements "${product_path}" "--timestamp" || { echo "❌ Final sign (with entitlements) failed"; exit 1; }
           else
             retry_codesign "${product_path}" "--timestamp" || { echo "❌ Final sign failed"; exit 1; }
