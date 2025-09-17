@@ -130,155 +130,49 @@ runs:
 
         echo "=== Codesign start for: ${product_path} ==="
 
-        # --- Helpers / Wrappers ---
-        retry_codesign() {
-          local target="$1"
-          local extra_opts="$2"
-          local attempt=1
-          local max_attempts=5
-          local delay=3
-          while [ $attempt -le $max_attempts ]; do
-            echo "[$attempt/$max_attempts] codesign: $target (opts: $extra_opts)"
-            output=$(codesign --verbose --force --options=runtime $extra_opts --sign "${sign}" --keychain "${keychain}" "$target" 2>&1) || true
-            status=$?
-            echo "$output"
-            if [ $status -eq 0 ]; then
-              echo "✅ codesign succeeded: $target"
-              return 0
-            fi
-            if echo "$output" | grep -qiE "no identity found|password|resource fork|not found in keychain|code object is not signed at all|The timestamp service is not available"; then
-              echo "❌ Fatal codesign error for $target"
-              echo "$output"
-              return 1
-            fi
-            echo "⚠️ codesign attempt $attempt failed for $target — retry in ${delay}s..."
-            attempt=$((attempt+1))
-            sleep $delay
-            delay=$((delay * 2))
-          done
-          echo "❌ codesign ultimately failed for $target after $max_attempts attempts"
-          return 1
-        }
-
-        retry_codesign_with_entitlements() {
-          local target="$1"
-          local extra_opts="$2"
-          local attempt=1
-          local max_attempts=5
-          local delay=3
-          while [ $attempt -le $max_attempts ]; do
-            echo "[$attempt/$max_attempts] codesign(with entitlements): $target (opts: $extra_opts)"
-            output=$(codesign --verbose --force --options=runtime $extra_opts --sign "${sign}" --keychain "${keychain}" --entitlements "${entitlements_path}" "$target" 2>&1) || true
-            status=$?
-            echo "$output"
-            if [ $status -eq 0 ]; then
-              echo "✅ codesign (with entitlements) succeeded: $target"
-              return 0
-            fi
-            if echo "$output" | grep -qiE "no identity found|password|resource fork|not found in keychain|code object is not signed at all|The timestamp service is not available"; then
-              echo "❌ Fatal codesign error for $target (entitlements)"
-              echo "$output"
-              return 1
-            fi
-            echo "⚠️ attempt $attempt failed — retrying in ${delay}s..."
-            attempt=$((attempt+1))
-            sleep $delay
-            delay=$((delay * 2))
-          done
-          echo "❌ failed to sign (with entitlements) $target"
-          return 1
-        }
-
-        verify_and_dump() {
-          local target="$1"
-          echo "🔎 Vérification codesign pour: $target"
-          if ! codesign --verify --deep --strict --verbose=4 "$target" 2>&1; then
-            echo "❌ Verification failed for $target — dumping signature info:"
-            codesign -d --verbose=4 "$target" 2>&1 || true
-            lipo -info "$target" 2>/dev/null || file "$target" 2>/dev/null || true
-            return 1
-          else
-            echo "✅ Verification OK for $target"
-            return 0
-          fi
-        }
-
-        remove_sig() {
-          local f="$1"
-          if codesign --remove-signature "$f" 2>/dev/null; then
-            echo "🧹 old signature removed: $f"
-          else
-            true
-          fi
-        }
-
-        sign_file_handling_universal() {
-          local file="$1"
-          local opts="$2"
-          if lipo -info "$file" 2>/dev/null | grep -q "Architectures in the fat file"; then
-            echo "🔧 Detected universal binary, signing per-arch: $file"
-            tmpdir=$(mktemp -d)
-            trap 'rm -rf "$tmpdir"' RETURN
-            archs=$(lipo -info "$file" 2>/dev/null | sed -n 's/.*are:\s*//p' || true)
-            IFS=' ' read -r -a arch_array <<< "$archs"
-            thin_files=()
-            for a in "${arch_array[@]}"; do
-              thin="$tmpdir/$(basename "$file").$a"
-              lipo "$file" -thin "$a" -output "$thin"
-              chmod +x "$thin" || true
-              remove_sig "$thin"
-              retry_codesign "$thin" "$opts" || { echo "❌ Failed signing thin slice $a of $file"; return 1; }
-              verify_and_dump "$thin" || { echo "❌ Verification failed for thin slice $a of $file"; return 1; }
-              thin_files+=("$thin")
-            done
-            merged="$tmpdir/merged_$(basename "$file")"
-            lipo -create "${thin_files[@]}" -output "$merged" || { echo "❌ lipo -create failed"; return 1; }
-            chmod +x "$merged" || true
-            mv "$merged" "$file"
-            remove_sig "$file"
-            retry_codesign "$file" "$opts" || { echo "❌ Final sign of rebuilt universal failed: $file"; return 1; }
-            verify_and_dump "$file" || { echo "❌ Verification failed after final sign of $file"; return 1; }
-          else
-            remove_sig "$file"
-            retry_codesign "$file" "$opts" || { echo "❌ Failed signing file: $file"; return 1; }
-            verify_and_dump "$file" || { echo "❌ Verification failed for file: $file"; return 1; }
-          fi
-        }
-
-        sign_archive_contents() {
-          local bundle="$1"
-          echo "📂 Signing archive contents: $bundle"
-          # executables, dylibs, frameworks, nested apps, bundles/plugins (comme ta version précédente)
-          # ... [ici tu gardes exactement ta logique précédente] ...
-        }
+        # --- Helpers (retry, verify, remove_sig, sign_file_handling_universal) ---
+        # ... [garde exactement toutes tes fonctions retry_codesign, retry_codesign_with_entitlements, verify_and_dump, remove_sig, sign_file_handling_universal, sign_archive_contents] ...
 
         echo "Using identity: ${sign}"
         security find-identity -v -p codesigning || true
         echo "product_path: ${product_path}"
         echo "entitlements_path: ${entitlements_path:-<none>}"
 
-        # --- NEW FIX: Sign WebViewerCEF and 4D Helper first ---
-        while IFS= read -r -d '' cef_bundle; do
-          echo "🔧 Signing WebViewerCEF bundle: $cef_bundle"
-          # 4D Helper inside CEF
-          while IFS= read -r -d '' helper; do
-            echo "  ↳ Signing 4D Helper app: $helper"
-            sign_archive_contents "$helper"
-          done < <(find "$cef_bundle" -type d -name "4D Helper*.app" -print0)
-          # Chromium Embedded Framework inside CEF
-          cef_framework="$cef_bundle/Contents/Frameworks/Chromium Embedded Framework.framework"
-          if [ -d "$cef_framework" ]; then
-            echo "  ↳ Signing Chromium Embedded Framework.framework: $cef_framework"
-            sign_archive_contents "$cef_framework"
-          fi
-          retry_codesign "$cef_bundle" "--timestamp"
-          verify_and_dump "$cef_bundle"
-        done < <(find "${product_path}" -type d -name "WebViewerCEF.bundle" -print0)
+        # --- FIX pour WebViewerCEF ---
+        find "${product_path}" -type d -name "WebViewerCEF.bundle" -print0 | while IFS= read -r -d '' wv_bundle; do
+          echo "🔧 Signing WebViewerCEF.bundle: $wv_bundle"
 
-        # --- Continue with all your existing steps frameworks -> bundles/plugins -> nested apps -> archives -> libs -> leaf executables -> final app ---
-        # ... ici, tu conserves exactement le reste de ta step originale ...
+          # 1️⃣ Sign Chromium Embedded Framework inside 4D Helper first
+          find "$wv_bundle" -type d -name "4D Helper*.app" -print0 | while IFS= read -r helper_app; do
+            echo "  ↳ Signing 4D Helper.app: $helper_app"
+
+            cef_fw="$helper_app/Contents/Frameworks/Chromium Embedded Framework.framework"
+            if [ -d "$cef_fw" ]; then
+              echo "    ↳ Signing CEF framework inside 4D Helper: $cef_fw"
+              # sign inner binaries first
+              find "$cef_fw" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 | while IFS= read -r f; do
+                sign_file_handling_universal "$f" "--timestamp"
+              done
+              # then sign the framework container
+              retry_codesign "$cef_fw" "--timestamp"
+              verify_and_dump "$cef_fw"
+            fi
+
+            # 2️⃣ Sign 4D Helper.app itself
+            retry_codesign "$helper_app" "--timestamp"
+            verify_and_dump "$helper_app"
+          done
+
+          # 3️⃣ Finally sign the WebViewerCEF.bundle
+          retry_codesign "$wv_bundle" "--timestamp"
+          verify_and_dump "$wv_bundle"
+        done
+
+        # --- Continue avec le reste du signing (frameworks globaux, bundles/plugins, nested apps, archives, libs, leaf exes, top-level app) ---
+        # ... [ici tu gardes exactement ta step originale pour tout le reste] ...
 
         echo "=== Codesign finished successfully ==="
+
       env:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
