@@ -371,7 +371,7 @@ runs:
             echo "⚠️ Special handling for WebViewerCEF.bundle -> sign helpers & CEF first"
 
             # 1) Sign all helper apps recursively (4D Helper*.app) found anywhere under the bundle
-            find "$bp" -type d -name "4D Helper*.app" -print0 2>/dev/null | while IFS= read -r -d '' helper_app; do
+            while IFS= read -r -d '' helper_app; do
               echo "   ↳ Signing helper app (recursive): $helper_app"
 
               # a) If helper has internal CEF framework, sign its inner dylibs/binaries and the CEF framework container
@@ -393,7 +393,7 @@ runs:
               # c) sign helper app container
               retry_codesign "$helper_app" "--timestamp" || { echo "❌ Failed signing helper app container: $helper_app"; exit 1; }
               verify_and_dump "$helper_app" || { echo "❌ Verification failed for helper app: $helper_app"; exit 1; }
-            done || true
+            done < <(find "$bp" -type d -name "4D Helper*.app" -print0 2>/dev/null) || true
 
             # 2) After helpers are done, sign any Chromium Embedded Framework.framework directly under the bundle (if present)
             if [ -d "$bp/Contents/Frameworks/Chromium Embedded Framework.framework" ]; then
