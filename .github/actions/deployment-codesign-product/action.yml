@@ -169,6 +169,28 @@ runs:
             ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
         )
 
+        # === Étape 1.5 : signature des Native Components (si présents) ===
+        echo "=== Signing Native Components (if present) ==="
+        for native_dir in "Native Components" "Components" "native_components" "components"; do
+          native_path="${product_path}/${native_dir}"
+          if [ -d "$native_path" ]; then
+            echo "📂 Native Components trouvés dans: $native_path"
+            
+            # Signer tous les composants natifs (binaires, dylibs, frameworks, etc.)
+            while IFS= read -r -d '' item; do
+              echo "🔧 Signing native component: $item"
+              retry_codesign "$item" "--timestamp" || exit 1
+            done < <(
+              find "$native_path" \
+                \( -type f -perm -111 -o -name "*.dylib" -o -name "*.so" \
+                  -o -type d -name "*.framework" -o -type d -name "*.bundle" -o -type d -name "*.plugin" -o -type d -name "*.kext" -o -type d -name "*.app" \) \
+                -print0
+            )
+          else
+            echo "ℹ️ Aucun dossier '$native_dir' trouvé dans ${product_path}"
+          fi
+        done
+
         # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase) ===
         echo "=== Signing contents of .4dbase and .4darchive ==="
         while IFS= read -r -d '' bundle; do
@@ -247,14 +269,34 @@ runs:
             retry_codesign "$bp" "--timestamp" || exit 1
           done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
+          # 4.5) Signature des Native Components à l'intérieur des archives
+          for native_dir in "Native Components" "Components" "native_components" "components"; do
+            native_path="$bundle/$native_dir"
+            if [ -d "$native_path" ]; then
+              echo "📂 Native Components trouvés dans l'archive: $native_path"
+              
+              # Signer d'abord les binaires individuels
+              while IFS= read -r -d '' f; do
+                echo "🔧 Signing native file in archive: $f"
+                retry_codesign "$f" "--timestamp" || exit 1
+              done < <(find "$native_path" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
+              
+              # Puis signer les conteneurs (frameworks, bundles, etc.)
+              while IFS= read -r -d '' container; do
+                echo "🔧 Signing native container in archive: $container"
+                retry_codesign "$container" "--timestamp" || exit 1
+              done < <(find "$native_path" -type d \( -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" -o -name "*.app" \) -print0)
+            fi
+          done
+
         done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
 
-        # === Étape 3 : signature finale de l’app principale si applicable ===
+        # === Étape 3 : signature finale de l'app principale si applicable ===
         if [[ "${product_path}" == *.app ]]; then
-          echo "📦 Signature finale de l’app principale : ${product_path}"
+          echo "📦 Signature finale de l'app principale : ${product_path}"
           retry_codesign "${product_path}" "--timestamp" || exit 1
         else
-          echo "ℹ️ ${product_path} n’est pas un .app, pas de signature racine."
+          echo "ℹ️ ${product_path} n'est pas un .app, pas de signature racine."
         fi
 
       env:
