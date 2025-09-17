@@ -130,7 +130,7 @@ runs:
 
         echo "=== Codesign start for: ${product_path} ==="
 
-        # retry_codesign : signe sans entitlements (réutilisable pour la plupart des items)
+        # --- Helpers / Wrappers ---
         retry_codesign() {
           local target="$1"
           local extra_opts="$2"
@@ -160,7 +160,6 @@ runs:
           return 1
         }
 
-        # retry_codesign_with_entitlements : wrapper pour la signature finale (utilise entitlements)
         retry_codesign_with_entitlements() {
           local target="$1"
           local extra_opts="$2"
@@ -190,7 +189,6 @@ runs:
           return 1
         }
 
-        # helper : verify immediately the signed item, print diagnostics if fail
         verify_and_dump() {
           local target="$1"
           echo "🔎 Vérification codesign pour: $target"
@@ -205,7 +203,6 @@ runs:
           fi
         }
 
-        # helper : remove signature safely
         remove_sig() {
           local f="$1"
           if codesign --remove-signature "$f" 2>/dev/null; then
@@ -215,10 +212,10 @@ runs:
           fi
         }
 
-        # sign_file_handling_universal : signe un fichier binaire, gère les fat/universal slices
+        # signe un binaire, gère universal/fat (thin per-arch -> sign -> lipo create -> resigner final)
         sign_file_handling_universal() {
           local file="$1"
-          local opts="$2"   # ex: "--deep --timestamp" or "--timestamp"
+          local opts="$2"   # ex: "--timestamp" (NOTE: we avoid --deep here for thin/per-arch signing)
           if lipo -info "$file" 2>/dev/null | grep -q "Architectures in the fat file"; then
             echo "🔧 Detected universal binary, signing per-arch: $file"
             tmpdir=$(mktemp -d)
@@ -242,10 +239,9 @@ runs:
             merged="$tmpdir/merged_$(basename "$file")"
             echo "🔧 Rebuilding universal binary -> $merged"
             lipo -create "${thin_files[@]}" -output "$merged" || { echo "❌ lipo -create failed"; return 1; }
-            # preserve executable bit and replace original atomically
             chmod +x "$merged" || true
             mv "$merged" "$file"
-            # resigner le binaire final après reconstruction
+            # resigner le binaire final (sans --deep)
             remove_sig "$file"
             retry_codesign "$file" "$opts" || { echo "❌ Final sign of rebuilt universal failed: $file"; return 1; }
             verify_and_dump "$file" || { echo "❌ Verification failed after final sign of $file"; return 1; }
@@ -258,15 +254,81 @@ runs:
           fi
         }
 
-        # --- 0) Sanity: afficher identity disponible et variables
+        # sign contents of a .4dbase / .4darchive (internal archive directories)
+        sign_archive_contents() {
+          local bundle="$1"
+          echo "📂 Signing archive contents: $bundle"
+
+          # 1) executables & libs
+          while IFS= read -r -d '' f; do
+            echo "🔧 [archive] signing file: $f"
+            sign_file_handling_universal "$f" "--timestamp" || return 1
+          done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 || true)
+
+          # 2) frameworks inside archive
+          while IFS= read -r -d '' fw; do
+            echo "📘 [archive] framework: $fw"
+            fwname="$(basename "$fw" .framework)"
+            candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
+            found=""
+            for c in "${candidates[@]}"; do
+              if [ -f "$c" ]; then found="$c"; break; fi
+            done
+            if [ -z "$found" ]; then
+              found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
+            fi
+            if [ -n "$found" ]; then
+              sign_file_handling_universal "$found" "--timestamp" || return 1
+            fi
+            while IFS= read -r -d '' dylib; do
+              sign_file_handling_universal "$dylib" "--timestamp" || return 1
+            done < <(find "$fw" -type f -name "*.dylib" -print0 || true)
+            retry_codesign "$fw" "--timestamp" || return 1
+          done < <(find "$bundle" -type d -name "*.framework" -print0 || true)
+
+          # 3) nested apps inside archive
+          while IFS= read -r -d '' app; do
+            echo "📦 [archive] nested app: $app"
+            mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
+            if [ -f "$mainexe" ]; then
+              sign_file_handling_universal "$mainexe" "--timestamp" || return 1
+            else
+              exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
+              if [ -n "$exe" ]; then
+                sign_file_handling_universal "$exe" "--timestamp" || return 1
+              fi
+            fi
+            while IFS= read -r -d '' dylib; do
+              sign_file_handling_universal "$dylib" "--timestamp" || return 1
+            done < <(find "$app" -type f -name "*.dylib" -print0 || true)
+            retry_codesign "$app" "--timestamp" || return 1
+          done < <(find "$bundle" -type d -name "*.app" -print0 || true)
+
+          # 4) bundles/plugins inside archive
+          while IFS= read -r -d '' bp; do
+            echo "🔌 [archive] bundle/plugin: $bp"
+            exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
+            if [ -n "$exe" ]; then
+              sign_file_handling_universal "$exe" "--timestamp" || return 1
+            fi
+            while IFS= read -r -d '' bpdylib; do
+              sign_file_handling_universal "$bpdylib" "--timestamp" || return 1
+            done < <(find "$bp" -type f -name "*.dylib" -print0 || true)
+            retry_codesign "$bp" "--timestamp" || return 1
+          done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0 || true)
+
+          return 0
+        }
+
+        # --- Sanity ---
         echo "Using identity: ${sign}"
         security find-identity -v -p codesigning || true
         echo "product_path: ${product_path}"
         echo "entitlements_path: ${entitlements_path:-<none>}"
 
-        # -------- ORDRE CORRECT : frameworks -> bundles/plugins/kext -> nested apps -> libs -> staging libs -> leaf executables -> final app
+        # ---- SIGN ORDER: frameworks -> bundles/plugins/kext -> nested apps -> archives (.4dbase/.4darchive) -> libs -> staging libs -> leaf exes -> final app
 
-        # === Étape C : frameworks (TOUS les frameworks dans le product_path, y compris ceux dans bundles) ===
+        # === Étape C : frameworks (globally) ===
         echo "=== Étape C: Signing frameworks (global) ==="
         while IFS= read -r -d '' fw; do
           echo "📘 Framework: $fw"
@@ -280,100 +342,93 @@ runs:
             found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
           fi
           if [ -n "$found" ]; then
-            echo "🔧 Signing inner framework binary: $found"
-            sign_file_handling_universal "$found" "--deep --timestamp" || { echo "❌ Failed signing framework inner: $found"; exit 1; }
+            sign_file_handling_universal "$found" "--timestamp" || { echo "❌ Failed signing framework inner: $found"; exit 1; }
           else
             echo "⚠️ Aucun binaire exécutable trouvé dans $fw"
           fi
 
-          # sign dylibs inside framework
           while IFS= read -r -d '' dylib; do
-            sign_file_handling_universal "$dylib" "--deep --timestamp" || { echo "❌ Failed signing dylib in fw: $dylib"; exit 1; }
-          done < <(find "$fw" -type f -name "*.dylib" -print0)
+            sign_file_handling_universal "$dylib" "--timestamp" || { echo "❌ Failed signing dylib in fw: $dylib"; exit 1; }
+          done < <(find "$fw" -type f -name "*.dylib" -print0 || true)
 
-          retry_codesign "$fw" "--deep --timestamp" || { echo "❌ Failed signing framework container: $fw"; exit 1; }
+          retry_codesign "$fw" "--timestamp" || { echo "❌ Failed signing framework container: $fw"; exit 1; }
           verify_and_dump "$fw" || { echo "❌ Verification failed for framework container: $fw"; exit 1; }
-        done < <(find "${product_path}" -type d -name "*.framework" -print0)
+        done < <(find "${product_path}" -type d -name "*.framework" -print0 || true)
 
-        # === Étape D : Bundles / plugins / kext (signer containers après avoir signé tout ce qu'il y a dedans) ===
+        # === Étape D : Bundles / plugins / kext (containers signed AFTER their inner components) ===
         echo "=== Étape D: Signing bundles/plugins/kexts ==="
         while IFS= read -r -d '' bp; do
           echo "🔌 Plugin/Bundle/Kext: $bp"
-          # sign inner executable if present
           exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
           if [ -n "$exe" ]; then
-            echo "🔧 signing inner exe: $exe"
-            sign_file_handling_universal "$exe" "--deep --timestamp" || { echo "❌ Failed signing inner exe of bundle: $exe"; exit 1; }
+            sign_file_handling_universal "$exe" "--timestamp" || { echo "❌ Failed signing inner exe of bundle: $exe"; exit 1; }
           fi
-
-          # sign nested frameworks/dylibs inside bundle if any (they were likely signed by global frameworks step but keep for safety)
           while IFS= read -r -d '' bpdylib; do
-            sign_file_handling_universal "$bpdylib" "--deep --timestamp" || { echo "❌ Failed signing bpdylib: $bpdylib"; exit 1; }
-          done < <(find "$bp" -type f -name "*.dylib" -print0)
-
-          retry_codesign "$bp" "--deep --timestamp" || { echo "❌ Failed signing bundle container: $bp"; exit 1; }
+            sign_file_handling_universal "$bpdylib" "--timestamp" || { echo "❌ Failed signing bpdylib: $bpdylib"; exit 1; }
+          done < <(find "$bp" -type f -name "*.dylib" -print0 || true)
+          retry_codesign "$bp" "--timestamp" || { echo "❌ Failed signing bundle container: $bp"; exit 1; }
           verify_and_dump "$bp" || { echo "❌ Verification failed for bundle container: $bp"; exit 1; }
-        done < <(find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
+        done < <(find "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0 || true)
 
-        # === Étape E : nested .app (tout ce qui est .app à l'intérieur du product_path sauf l'app racine) ===
+        # === Étape E : nested .app (exclude top-level app) ===
         echo "=== Étape E: Signing nested .app bundles ==="
         while IFS= read -r -d '' app; do
-          # exclude top-level app itself
-          if [[ "$app" == "${product_path}" ]]; then
-            continue
-          fi
+          if [[ "$app" == "${product_path}" ]]; then continue; fi
           echo "📦 Internal app: $app"
           mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
           if [ -f "$mainexe" ]; then
-            echo "🔧 main exe: $mainexe"
-            sign_file_handling_universal "$mainexe" "--deep --timestamp" || { echo "❌ Failed signing nested main exe: $mainexe"; exit 1; }
+            sign_file_handling_universal "$mainexe" "--timestamp" || { echo "❌ Failed signing nested main exe: $mainexe"; exit 1; }
           else
             exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
             if [ -n "$exe" ]; then
-              sign_file_handling_universal "$exe" "--deep --timestamp" || { echo "❌ Failed signing nested fallback exe: $exe"; exit 1; }
+              sign_file_handling_universal "$exe" "--timestamp" || { echo "❌ Failed signing nested fallback exe: $exe"; exit 1; }
             fi
           fi
-
-          # sign dylibs inside nested app
           while IFS= read -r -d '' dylib; do
-            sign_file_handling_universal "$dylib" "--deep --timestamp" || { echo "❌ Failed signing dylib in nested app: $dylib"; exit 1; }
-          done < <(find "$app" -type f -name "*.dylib" -print0)
-
-          retry_codesign "$app" "--deep --timestamp" || { echo "❌ Failed signing nested app container: $app"; exit 1; }
+            sign_file_handling_universal "$dylib" "--timestamp" || { echo "❌ Failed signing dylib in nested app: $dylib"; exit 1; }
+          done < <(find "$app" -type f -name "*.dylib" -print0 || true)
+          retry_codesign "$app" "--timestamp" || { echo "❌ Failed signing nested app container: $app"; exit 1; }
           verify_and_dump "$app" || { echo "❌ Verification failed for nested app container: $app"; exit 1; }
-        done < <(find "${product_path}" -type d -name "*.app" -print0)
+        done < <(find "${product_path}" -type d -name "*.app" -print0 || true)
+
+        # === Étape ARCHIVES : .4dbase / .4darchive contenus internes ===
+        echo "=== Étape ARCHIVES: Signing .4dbase and .4darchive contents ==="
+        while IFS= read -r -d '' archive; do
+          sign_archive_contents "$archive" || { echo "❌ Failed signing archive: $archive"; exit 1; }
+        done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0 || true)
 
         # === Étape B : libs et executables standards (hors framework/app) ===
         echo "=== Étape B: Signing dylibs / .so / other executables (non-framework, non-app) ==="
         while IFS= read -r -d '' file; do
           echo "---- processing lib/exe: $file ----"
-          sign_file_handling_universal "$file" "--deep --timestamp" || { echo "❌ Failed signing lib/exe: $file"; exit 1; }
+          sign_file_handling_universal "$file" "--timestamp" || { echo "❌ Failed signing lib/exe: $file"; exit 1; }
         done < <(find "${product_path}" -type f \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) \
-                ! -path "*.framework/*" ! -path "*.app/*" ! -path "*/Contents/MacOS/*" ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0)
+                ! -path "*.framework/*" ! -path "*.app/*" ! -path "*/Contents/MacOS/*" ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0 || true)
 
-        # === Étape X : SIGNER LES dylibs situés DANS LE REPERTOIRE DE STAGING (à côté de l'app) ===
+        # === Étape X : Signing dylibs in staging dir (sibling of the .app) ===
         echo "=== Étape X: Signing dylibs in staging dir (sibling of the .app) ==="
         staging_dir="$(dirname "${product_path}")"
         echo "Staging dir detected: ${staging_dir}"
         while IFS= read -r -d '' lib; do
           echo "🔧 Signing staging lib: $lib"
-          sign_file_handling_universal "$lib" "--deep --timestamp" || { echo "❌ Failed signing staging lib: $lib"; exit 1; }
+          sign_file_handling_universal "$lib" "--timestamp" || { echo "❌ Failed signing staging lib: $lib"; exit 1; }
         done < <(find "${staging_dir}" -type f \( -name "*.dylib" -o -name "*.so" \) ! -path "${product_path}/*" -print0 || true)
 
-        # === Étape A : executables internes (Contents/MacOS) - SIGN AFTER inner components ===
+        # === Étape A : leaf executables (Contents/MacOS) — SIGN AFTER inner components ===
         echo "=== Étape A: Signing executables in Contents/MacOS/ (now) ==="
         while IFS= read -r -d '' exe; do
           echo "---- processing: $exe ----"
-          sign_file_handling_universal "$exe" "--deep --timestamp" || { echo "❌ Failed signing leaf exe: $exe"; exit 1; }
-        done < <(find "${product_path}" -type f -path "*/Contents/MacOS/*" -perm -111 ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0)
+          sign_file_handling_universal "$exe" "--timestamp" || { echo "❌ Failed signing leaf exe: $exe"; exit 1; }
+        done < <(find "${product_path}" -type f -path "*/Contents/MacOS/*" -perm -111 ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0 || true)
 
         # === Étape F : Signature finale de l’app principale ===
         if [[ "${product_path}" == *.app ]]; then
           echo "=== Étape F: Final signing of top-level app (with entitlements if any) ==="
           if [[ -n "${entitlements_path-}" && -f "${entitlements_path}" ]]; then
-            retry_codesign_with_entitlements "${product_path}" "--deep --timestamp" || { echo "❌ Final sign (with entitlements) failed"; exit 1; }
+            # final sign avec entitlements MAIS sans --deep (on a déjà signé tout l'intérieur)
+            retry_codesign_with_entitlements "${product_path}" "--timestamp" || { echo "❌ Final sign (with entitlements) failed"; exit 1; }
           else
-            retry_codesign "${product_path}" "--deep --timestamp" || { echo "❌ Final sign failed"; exit 1; }
+            retry_codesign "${product_path}" "--timestamp" || { echo "❌ Final sign failed"; exit 1; }
           fi
 
           echo "🔎 Final verification of top-level app"
