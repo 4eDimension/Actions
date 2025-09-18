@@ -176,16 +176,31 @@ runs:
           if [ -d "$native_path" ]; then
             echo "📂 Native Components trouvés dans: $native_path"
             
-            # Signer tous les composants natifs (binaires, dylibs, frameworks, etc.)
-            while IFS= read -r -d '' item; do
-              echo "🔧 Signing native component: $item"
-              retry_codesign "$item" "--timestamp" || exit 1
-            done < <(
-              find "$native_path" \
-                \( -type f -perm -111 -o -name "*.dylib" -o -name "*.so" \
-                  -o -type d -name "*.framework" -o -type d -name "*.bundle" -o -type d -name "*.plugin" -o -type d -name "*.kext" -o -type d -name "*.app" \) \
-                -print0
-            )
+            # D'abord signer tous les binaires exécutables individuellement
+            while IFS= read -r -d '' exe; do
+              echo "🔧 Signing native executable: $exe"
+              retry_codesign "$exe" "--timestamp" || exit 1
+            done < <(find "$native_path" -type f -perm -111 -print0)
+            
+            # Puis signer les dylibs et .so
+            while IFS= read -r -d '' lib; do
+              echo "🔧 Signing native library: $lib"
+              retry_codesign "$lib" "--timestamp" || exit 1
+            done < <(find "$native_path" -type f \( -name "*.dylib" -o -name "*.so" \) -print0)
+            
+            # Enfin signer les conteneurs (bundles, frameworks, etc.) dans l'ordre correct
+            # D'abord les frameworks
+            while IFS= read -r -d '' fw; do
+              echo "🔧 Signing native framework: $fw"
+              retry_codesign "$fw" "--timestamp" || exit 1
+            done < <(find "$native_path" -type d -name "*.framework" -print0)
+            
+            # Puis les bundles/plugins/kexts/apps
+            while IFS= read -r -d '' bundle; do
+              echo "🔧 Signing native bundle: $bundle"
+              retry_codesign "$bundle" "--timestamp" || exit 1
+            done < <(find "$native_path" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" -o -name "*.app" \) -print0)
+            
           else
             echo "ℹ️ Aucun dossier '$native_dir' trouvé dans ${product_path}"
           fi
