@@ -176,30 +176,41 @@ runs:
           if [ -d "$native_path" ]; then
             echo "📂 Native Components trouvés dans: $native_path"
             
-            # D'abord signer tous les binaires exécutables individuellement
-            while IFS= read -r -d '' exe; do
-              echo "🔧 Signing native executable: $exe"
-              retry_codesign "$exe" "--timestamp" || exit 1
-            done < <(find "$native_path" -type f -perm -111 -print0)
+            # Pour chaque bundle dans Native Components
+            while IFS= read -r -d '' bundle_path; do
+              echo "📦 Processing Native Component bundle: $bundle_path"
+              bundle_name=$(basename "$bundle_path")
+              
+              # Étape 1: Signer TOUS les binaires/libs à l'intérieur du bundle, récursivement
+              echo "🔍 Signing all executables and libraries inside $bundle_name..."
+              while IFS= read -r -d '' binary; do
+                echo "🔧 Signing binary: $binary"
+                retry_codesign "$binary" "--timestamp" || exit 1
+              done < <(find "$bundle_path" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 | sort -z)
+              
+              # Étape 2: Signer les frameworks internes (s'il y en a)
+              while IFS= read -r -d '' fw; do
+                echo "🔧 Signing internal framework: $fw"
+                retry_codesign "$fw" "--timestamp" || exit 1
+              done < <(find "$bundle_path" -type d -name "*.framework" -print0)
+              
+              # Étape 3: Signer les bundles/plugins internes (s'il y en a)
+              while IFS= read -r -d '' internal_bundle; do
+                echo "🔧 Signing internal bundle: $internal_bundle"
+                retry_codesign "$internal_bundle" "--timestamp" || exit 1
+              done < <(find "$bundle_path" -mindepth 1 -type d \( -name "*.bundle" -o -name "*.plugin" \) -print0)
+              
+              # Étape 4: Signer le bundle principal lui-même
+              echo "🔧 Signing main bundle: $bundle_path"
+              retry_codesign "$bundle_path" "--timestamp" || exit 1
+              
+            done < <(find "$native_path" -maxdepth 1 -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" -o -name "*.app" \) -print0)
             
-            # Puis signer les dylibs et .so
-            while IFS= read -r -d '' lib; do
-              echo "🔧 Signing native library: $lib"
-              retry_codesign "$lib" "--timestamp" || exit 1
-            done < <(find "$native_path" -type f \( -name "*.dylib" -o -name "*.so" \) -print0)
-            
-            # Enfin signer les conteneurs (bundles, frameworks, etc.) dans l'ordre correct
-            # D'abord les frameworks
-            while IFS= read -r -d '' fw; do
-              echo "🔧 Signing native framework: $fw"
-              retry_codesign "$fw" "--timestamp" || exit 1
-            done < <(find "$native_path" -type d -name "*.framework" -print0)
-            
-            # Puis les bundles/plugins/kexts/apps
-            while IFS= read -r -d '' bundle; do
-              echo "🔧 Signing native bundle: $bundle"
-              retry_codesign "$bundle" "--timestamp" || exit 1
-            done < <(find "$native_path" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" -o -name "*.app" \) -print0)
+            # Signer les autres éléments qui ne sont pas des bundles
+            while IFS= read -r -d '' other; do
+              echo "🔧 Signing other native component: $other"
+              retry_codesign "$other" "--timestamp" || exit 1
+            done < <(find "$native_path" -maxdepth 1 \( -type f -perm -111 -o -type f -name "*.dylib" -o -type f -name "*.so" -o -type d -name "*.framework" \) -print0)
             
           else
             echo "ℹ️ Aucun dossier '$native_dir' trouvé dans ${product_path}"
@@ -290,17 +301,30 @@ runs:
             if [ -d "$native_path" ]; then
               echo "📂 Native Components trouvés dans l'archive: $native_path"
               
-              # Signer d'abord les binaires individuels
-              while IFS= read -r -d '' f; do
-                echo "🔧 Signing native file in archive: $f"
-                retry_codesign "$f" "--timestamp" || exit 1
-              done < <(find "$native_path" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
+              # D'abord signer tous les binaires exécutables individuellement
+              while IFS= read -r -d '' exe; do
+                echo "🔧 Signing native executable in archive: $exe"
+                retry_codesign "$exe" "--timestamp" || exit 1
+              done < <(find "$native_path" -type f -perm -111 -print0)
               
-              # Puis signer les conteneurs (frameworks, bundles, etc.)
+              # Puis signer les dylibs et .so
+              while IFS= read -r -d '' lib; do
+                echo "🔧 Signing native library in archive: $lib"
+                retry_codesign "$lib" "--timestamp" || exit 1
+              done < <(find "$native_path" -type f \( -name "*.dylib" -o -name "*.so" \) -print0)
+              
+              # Enfin signer les conteneurs dans l'ordre correct
+              # D'abord les frameworks
+              while IFS= read -r -d '' fw; do
+                echo "🔧 Signing native framework in archive: $fw"
+                retry_codesign "$fw" "--timestamp" || exit 1
+              done < <(find "$native_path" -type d -name "*.framework" -print0)
+              
+              # Puis les bundles/plugins/kexts/apps
               while IFS= read -r -d '' container; do
                 echo "🔧 Signing native container in archive: $container"
                 retry_codesign "$container" "--timestamp" || exit 1
-              done < <(find "$native_path" -type d \( -name "*.framework" -o -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" -o -name "*.app" \) -print0)
+              done < <(find "$native_path" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" -o -name "*.app" \) -print0)
             fi
           done
 
