@@ -161,6 +161,15 @@ runs:
         # === Étape 1 : signer tous les binaires, frameworks, bundles, plugins, kexts et apps sauf .4dbase/.4darchive ===
         echo "=== Signing all main components ==="
         while IFS= read -r -d '' item; do
+          # ⚡ Fix notarisation : signer les binaires internes des bundles avant le bundle lui-même
+          if [[ "$item" == *.bundle ]]; then
+            for exe in "$item/Contents/MacOS/"*; do
+              if [ -f "$exe" ]; then
+                echo "🔧 Signing internal executable: $exe"
+                retry_codesign "$exe" "--timestamp" || exit 1
+              fi
+            done
+          fi
           retry_codesign "$item" "--timestamp" || exit 1
         done < <(
           find "${product_path}" \
@@ -195,7 +204,6 @@ runs:
               fi
             done
 
-            # fallback → premier exécutable trouvé dans le framework
             if [ -z "$found" ]; then
               found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
             fi
@@ -207,17 +215,15 @@ runs:
               echo "⚠️ Aucun binaire exécutable trouvé dans $fw (on signera quand même le .framework)"
             fi
 
-            # signer les .dylib à l'intérieur du framework
             while IFS= read -r -d '' dylib; do
               retry_codesign "$dylib" "--timestamp" || exit 1
             done < <(find "$fw" -type f -name "*.dylib" -print0)
 
-            # signer le framework lui-même (metadata)
             retry_codesign "$fw" "--timestamp" || exit 1
 
           done < <(find "$bundle" -type d -name "*.framework" -print0)
 
-          # 3) Applications internes (.app) → signer executable principal, dylibs, puis le .app
+          # 3) Applications internes (.app)
           while IFS= read -r -d '' app; do
             echo "📦 Internal .app: $app"
             mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
@@ -237,7 +243,7 @@ runs:
             retry_codesign "$app" "--timestamp" || exit 1
           done < <(find "$bundle" -type d -name "*.app" -print0)
 
-          # 4) Bundles / plugins / kext → signer premier exe trouvé puis le conteneur
+          # 4) Bundles / plugins / kext
           while IFS= read -r -d '' bp; do
             echo "🔌 Plugin/bundle/kext: $bp"
             exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
@@ -249,7 +255,7 @@ runs:
 
         done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
 
-        # === Étape 3 : signature finale de l’app principale si applicable ===
+        # === Étape 3 : signature finale de l’app principale ===
         if [[ "${product_path}" == *.app ]]; then
           echo "📦 Signature finale de l’app principale : ${product_path}"
           retry_codesign "${product_path}" "--timestamp" || exit 1
