@@ -38,7 +38,7 @@ runs:
           if [[ "$version" == "main" || "$version" -gt 20 ]]; then
             echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\",\"4D AIKit\"]}" > make.json
           else
-            echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\"]}" > make.json
+            echo "{\"output\": \"build\",\"targets\": [{\"path\": \"./\"}],\"postBuild\": {\"remove\": [\"Data\",\"tools\",\"package.json\",\"package-lock.json\",\"README.md\"]},\"dependencies\": [\"4D NetKit\",\"4D Progress\",\"4D SVG\",\"4D WritePro Interface\",\"4D ViewPro\",\"4D Widgets\",\"4D AIKit\"]}" > make.json
           fi
           echo "make.json created."
           git config --global commit.gpgsign false
