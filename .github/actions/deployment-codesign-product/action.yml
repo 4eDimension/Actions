@@ -23,6 +23,10 @@ inputs:
   dmg_path:
     required: true
     type: string
+  dmg_exists:
+    required: false
+    type: boolean
+    default: false
 
 outputs:
   product_path: 
@@ -281,7 +285,7 @@ runs:
 
     - name: hdiutil (sparse -> convert)
       id: hdiutil
-      if: ${{ !contains(inputs.product_path, 'update.mac.4darchive') }}
+      if: ${{ !inputs.dmg_exists && !contains(inputs.product_path, 'update.mac.4darchive') }}
       shell: bash
       env:
         product_path: ${{ inputs.product_path }}
