@@ -8,7 +8,9 @@ inputs:
 
 outputs:
   version:
-    value: ${{ steps.set.outputs.version }}
+    value: ${{ steps.bump.outputs.version }}
+  tag:
+    value: ${{ steps.bump.outputs.tag }}
   mode:
     value: ${{ inputs.mode }}
 
@@ -31,6 +33,7 @@ runs:
       shell: bash
 
     - name: Handle version bump (safe, without v-prefix)
+      id: bump
       run: |
         MODE="${{ inputs.mode }}"
         CURRENT_VERSION=$(jq -r .version package.json)
@@ -69,24 +72,20 @@ runs:
 
         # Mettre à jour package.json
         jq --arg v "$NEXT_VERSION" '.version=$v' package.json > tmp && mv tmp package.json
-
         git add package.json
         git commit -m "chore: bump version to $NEXT_VERSION"
 
         # Créer le tag non préfixé
         git tag "$NEXT_VERSION"
-
         echo "🏷️ Tag créé : $NEXT_VERSION"
+
+        # Exposer version et tag comme outputs
+        echo "version=${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "tag=${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
       shell: bash
 
     - name: Push commit + tag courant
       run: |
         git push origin main
-        git push origin "$NEXT_VERSION"
-      shell: bash
-
-    - id: set
-      run: |
-        version=$(jq -r '.version' package.json)
-        echo "version=${version}" >> "$GITHUB_OUTPUT"
+        git push origin ${{ steps.bump.outputs.tag }}
       shell: bash
