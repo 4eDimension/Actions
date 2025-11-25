@@ -37,8 +37,10 @@ runs:
 
         echo "📦 Version actuelle : $CURRENT_VERSION"
 
+        # Découper MAJOR.MINOR.PATCH
         IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
 
+        # Incrément selon le mode
         if [ "$MODE" == "major" ]; then
           MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
         elif [ "$MODE" == "minor" ]; then
@@ -51,34 +53,36 @@ runs:
         fi
 
         NEXT_VERSION="$MAJOR.$MINOR.$PATCH"
-
         echo "🎯 Nouvelle version : $NEXT_VERSION"
 
-        # Vérifier si ce tag existe déjà localement ou à distance
+        # Vérifier si le tag existe localement
         if git rev-parse "$NEXT_VERSION" >/dev/null 2>&1; then
-          echo "⚠️ Tag local $NEXT_VERSION existe déjà"
+          echo "⚠️ Tag local $NEXT_VERSION existe déjà, suppression"
           git tag -d "$NEXT_VERSION"
         fi
 
+        # Vérifier si le tag existe à distance
         if git ls-remote --tags origin | grep -q "refs/tags/$NEXT_VERSION"; then
           echo "❌ Le tag $NEXT_VERSION existe déjà à distance. Annulation."
           exit 1
         fi
 
-        # Écrire la version dans package.json (sans tag npm auto)
+        # Mettre à jour package.json
         jq --arg v "$NEXT_VERSION" '.version=$v' package.json > tmp && mv tmp package.json
 
         git add package.json
         git commit -m "chore: bump version to $NEXT_VERSION"
 
-        # Créer le tag (non préfixé !)
+        # Créer le tag non préfixé
         git tag "$NEXT_VERSION"
 
         echo "🏷️ Tag créé : $NEXT_VERSION"
       shell: bash
 
-    - name: Push commit and tag
-      run: git push origin main --tags
+    - name: Push commit + tag courant
+      run: |
+        git push origin main
+        git push origin "$NEXT_VERSION"
       shell: bash
 
     - id: set
