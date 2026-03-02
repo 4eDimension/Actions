@@ -215,6 +215,14 @@ runs:
 
           # Exécutables simples et libs (.dylib, .so, exécutables)
           while IFS= read -r -d '' f; do
+            # ignorer les fichiers non-signables
+            case "$f" in
+              *.pem|*.cer|*.crt|*.p12) 
+                echo "⚠️ Ignoré pour codesign : $f"
+                continue
+                ;;
+            esac
+            echo "🔧 Signing file: $f"
             retry_codesign "$f" "--timestamp" || exit 1
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
