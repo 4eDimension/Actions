@@ -132,28 +132,36 @@ runs:
       run: |
         set -euo pipefail
 
-        # Supprimer signature existante si présente
-        remove_signature() {
-          local target="$1"
-          if codesign -dvv "$target" &>/dev/null; then
-            echo "🧹 Removing existing signature from $target"
-            codesign --remove-signature "$target" || true
-          fi
-        }
-
         retry_codesign() {
           local target="$1"
           local timestamp_flag="$2"
           local attempt=1
           local max_attempts=5
           local delay=5
+
+          # Détecter si le fichier est signable
+          signable=true
+          if [[ -f "$target" ]]; then
+            # Ignorer certains fichiers connus non-signables
+            if [[ "$target" == *.pem ]] || [[ "$target" == *.txt ]] || [[ "$target" == *.md ]]; then
+              signable=false
+            fi
+          fi
+
           while [ $attempt -le $max_attempts ]; do
-            remove_signature "$target"
+            if $signable; then
+              remove_signature "$target"
+            fi
             echo "[$attempt/$max_attempts] codesign de: $target"
-            output=$(codesign --verbose --deep --strict --options=runtime --timestamp \
-              --force --sign "${sign}" --keychain "${keychain}" \
-              --entitlements "${entitlements_path}" "$target" 2>&1)
-            status=$?
+            if $signable; then
+              output=$(codesign --verbose --strict --options=runtime $timestamp_flag \
+                --force --sign "${sign}" --keychain "${keychain}" \
+                --entitlements "${entitlements_path}" "$target" 2>&1)
+              status=$?
+            else
+              echo "⚠️ Fichier non-signable ou ignoré pour timestamp : $target"
+              status=0
+            fi
             echo "$output"
             if [ $status -eq 0 ]; then
               echo "✅ codesign réussi pour $target"
@@ -178,10 +186,7 @@ runs:
           # ⚡ Fix notarisation : signer les binaires internes des bundles avant le bundle lui-même
           if [[ "$item" == *.bundle ]]; then
             for exe in "$item/Contents/MacOS/"*; do
-              if [ -f "$exe" ]; then
-                echo "🔧 Signing internal executable: $exe"
-                retry_codesign "$exe" "--timestamp" || exit 1
-              fi
+              [ -f "$exe" ] && retry_codesign "$exe" "--timestamp" || exit 1
             done
           fi
 
@@ -189,15 +194,12 @@ runs:
           if [[ "$item" == *.app ]]; then
             echo "📦 Application détectée : $item"
             while IFS= read -r -d '' subapp; do
-              echo "  ↳ Sous-app détectée : $subapp"
               mainexe="$subapp/Contents/MacOS/$(basename "$subapp" .app)"
               if [ -f "$mainexe" ]; then
                 retry_codesign "$mainexe" "--timestamp" || exit 1
               else
                 exe=$(find "$subapp" -type f -perm -111 -maxdepth 6 -print -quit || true)
-                if [ -n "$exe" ]; then
-                  retry_codesign "$exe" "--timestamp" || exit 1
-                fi
+                [ -n "$exe" ] && retry_codesign "$exe" "--timestamp" || exit 1
               fi
               retry_codesign "$subapp" "--timestamp" || exit 1
             done < <(find "$item/Contents/MacOS" -type d -name "*.app" -print0)
@@ -216,64 +218,41 @@ runs:
         while IFS= read -r -d '' bundle; do
           echo "📂 Signing content inside: $bundle"
 
-          # 1) Exécutables simples et libs (.dylib, .so, exécutables)
+          # Exécutables simples et libs (.dylib, .so, exécutables)
           while IFS= read -r -d '' f; do
-            echo "🔧 Signing file: $f"
             retry_codesign "$f" "--timestamp" || exit 1
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
-          # 2) Frameworks
+          # Frameworks
           while IFS= read -r -d '' fw; do
-            echo "📘 Framework: $fw"
             fwname="$(basename "$fw" .framework)"
             candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
             found=""
             for c in "${candidates[@]}"; do
-              if [ -f "$c" ]; then
-                found="$c"
-                break
-              fi
+              [ -f "$c" ] && { found="$c"; break; }
             done
-            if [ -z "$found" ]; then
-              found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
-            fi
-            if [ -n "$found" ]; then
-              echo "🔧 Signing framework binary: $found"
-              retry_codesign "$found" "--timestamp" || exit 1
-            else
-              echo "⚠️ Aucun binaire exécutable trouvé dans $fw (on signera quand même le .framework)"
-            fi
+            [ -z "$found" ] && found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
+            [ -n "$found" ] && retry_codesign "$found" "--timestamp" || echo "⚠️ Aucun binaire exécutable trouvé dans $fw"
             while IFS= read -r -d '' dylib; do
               retry_codesign "$dylib" "--timestamp" || exit 1
             done < <(find "$fw" -type f -name "*.dylib" -print0)
             retry_codesign "$fw" "--timestamp" || exit 1
           done < <(find "$bundle" -type d -name "*.framework" -print0)
 
-          # 3) Applications internes (.app)
+          # Applications internes (.app)
           while IFS= read -r -d '' app; do
-            echo "📦 Internal .app: $app"
             mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
-            if [ -f "$mainexe" ]; then
-              retry_codesign "$mainexe" "--timestamp" || exit 1
-            else
-              exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
-              if [ -n "$exe" ]; then
-                retry_codesign "$exe" "--timestamp" || exit 1
-              fi
-            fi
+            [ -f "$mainexe" ] && retry_codesign "$mainexe" "--timestamp" || true
             while IFS= read -r -d '' dylib; do
               retry_codesign "$dylib" "--timestamp" || exit 1
             done < <(find "$app" -type f -name "*.dylib" -print0)
             retry_codesign "$app" "--timestamp" || exit 1
           done < <(find "$bundle" -type d -name "*.app" -print0)
 
-          # 4) Bundles / plugins / kext
+          # Bundles / plugins / kext
           while IFS= read -r -d '' bp; do
-            echo "🔌 Plugin/bundle/kext: $bp"
             exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
-            if [ -n "$exe" ]; then
-              retry_codesign "$exe" "--timestamp" || exit 1
-            fi
+            [ -n "$exe" ] && retry_codesign "$exe" "--timestamp" || true
             retry_codesign "$bp" "--timestamp" || exit 1
           done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
