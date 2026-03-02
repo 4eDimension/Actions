@@ -214,9 +214,33 @@ runs:
                 ;;
             esac
 
-            echo "🔧 Signing file for notarization: $f"
+            echo "🔧 Signing file: $f"
 
-            retry_codesign "$f" "--timestamp" || exit 1
+            # Retry codesign avec suppression signature existante si nécessaire
+            attempt=1
+            max_attempts=5
+            while [ $attempt -le $max_attempts ]; do
+              # supprimer la signature existante
+              if codesign --verify --deep "$f" &>/dev/null; then
+                echo "🧹 Removing existing signature from $f"
+                codesign --remove-signature "$f"
+              fi
+
+              # codesign avec timestamp sécurisé
+              if codesign --verbose --strict --options=runtime --sign "$sign" --timestamp "$f"; then
+                echo "✅ codesign réussi pour $f"
+                break
+              else
+                echo "⚠️ Tentative $attempt échouée pour $f"
+                attempt=$((attempt + 1))
+                sleep $((5 * attempt))
+              fi
+            done
+
+            if [ $attempt -gt $max_attempts ]; then
+              echo "❌ codesign définitivement échoué pour $f"
+              exit 1
+            fi
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
           # 2) Frameworks
