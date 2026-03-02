@@ -150,8 +150,7 @@ runs:
           while [ $attempt -le $max_attempts ]; do
             remove_signature "$target"
             echo "[$attempt/$max_attempts] codesign de: $target"
-            output=$(codesign --verbose --deep --strict --options=runtime \
-              --timestamp=rfc3161 --ts=https://timestamp.apple.com/ts01 \
+            output=$(codesign --verbose --deep --strict --options=runtime --timestamp \
               --force --sign "${sign}" --keychain "${keychain}" \
               --entitlements "${entitlements_path}" "$target" 2>&1)
             status=$?
