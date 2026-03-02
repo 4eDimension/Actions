@@ -142,7 +142,7 @@ runs:
             echo "[$attempt/$max_attempts] codesign de: $target"
             output=$(codesign --verbose --deep --strict --options=runtime $timestamp_flag \
               --force --sign "${sign}" --keychain "${keychain}" \
-              --entitlements "${entitlements_path}" "$target" 2>&1) || true
+              --entitlements "${entitlements_path}" "$target" 2>&1)
             status=$?
             echo "$output"
             if [ $status -eq 0 ]; then
@@ -162,6 +162,7 @@ runs:
           return 1
         }
 
+        # === Étape 1 : signer tous les binaires, frameworks, bundles, plugins, kexts et apps sauf .4dbase/.4darchive ===
         echo "=== Signing all main components ==="
         while IFS= read -r -d '' item; do
           # ⚡ Fix notarisation : signer les binaires internes des bundles avant le bundle lui-même
@@ -169,7 +170,7 @@ runs:
             for exe in "$item/Contents/MacOS/"*; do
               if [ -f "$exe" ]; then
                 echo "🔧 Signing internal executable: $exe"
-                retry_codesign "$exe" "--timestamp" || retry_codesign "$exe" "--timestamp=none" || exit 1
+                retry_codesign "$exe" "--timestamp" || exit 1
               fi
             done
           fi
@@ -181,18 +182,18 @@ runs:
               echo "  ↳ Sous-app détectée : $subapp"
               mainexe="$subapp/Contents/MacOS/$(basename "$subapp" .app)"
               if [ -f "$mainexe" ]; then
-                retry_codesign "$mainexe" "--timestamp" || retry_codesign "$mainexe" "--timestamp=none" || exit 1
+                retry_codesign "$mainexe" "--timestamp" || exit 1
               else
                 exe=$(find "$subapp" -type f -perm -111 -maxdepth 6 -print -quit || true)
                 if [ -n "$exe" ]; then
-                  retry_codesign "$exe" "--timestamp" || retry_codesign "$exe" "--timestamp=none" || exit 1
+                  retry_codesign "$exe" "--timestamp" || exit 1
                 fi
               fi
-              retry_codesign "$subapp" "--timestamp" || retry_codesign "$subapp" "--timestamp=none" || exit 1
+              retry_codesign "$subapp" "--timestamp" || exit 1
             done < <(find "$item/Contents/MacOS" -type d -name "*.app" -print0)
           fi
 
-          retry_codesign "$item" "--timestamp" || retry_codesign "$item" "--timestamp=none" || exit 1
+          retry_codesign "$item" "--timestamp" || exit 1
         done < <(
           find "${product_path}" \
             \( -type f -perm -111 -o -name "*.dylib" -o -name "*.so" \
@@ -200,51 +201,20 @@ runs:
             ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
         )
 
+        # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase) ===
         echo "=== Signing contents of .4dbase and .4darchive ==="
         while IFS= read -r -d '' bundle; do
           echo "📂 Signing content inside: $bundle"
 
           # 1) Exécutables simples et libs (.dylib, .so, exécutables)
           while IFS= read -r -d '' f; do
-            # ignorer les fichiers non-signables
-            case "$f" in
-              *.pem|*.cer|*.crt|*.p12|*.xlf) 
-                echo "⚠️ Ignoré pour codesign : $f"
-                continue
-                ;;
-            esac
-
             echo "🔧 Signing file: $f"
-
-            # Retry codesign avec suppression signature existante si nécessaire
-            attempt=1
-            max_attempts=5
-            while [ $attempt -le $max_attempts ]; do
-              # supprimer la signature existante
-              if codesign --verify --deep "$f" &>/dev/null; then
-                echo "🧹 Removing existing signature from $f"
-                codesign --remove-signature "$f"
-              fi
-
-              # codesign avec timestamp sécurisé
-              if codesign --verbose --strict --options=runtime --sign "$sign" --timestamp "$f"; then
-                echo "✅ codesign réussi pour $f"
-                break
-              else
-                echo "⚠️ Tentative $attempt échouée pour $f"
-                attempt=$((attempt + 1))
-                sleep $((5 * attempt))
-              fi
-            done
-
-            if [ $attempt -gt $max_attempts ]; then
-              echo "❌ codesign définitivement échoué pour $f"
-              exit 1
-            fi
+            retry_codesign "$f" "--timestamp" || exit 1
           done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
           # 2) Frameworks
           while IFS= read -r -d '' fw; do
+            echo "📘 Framework: $fw"
             fwname="$(basename "$fw" .framework)"
             candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
             found=""
@@ -259,40 +229,42 @@ runs:
             fi
             if [ -n "$found" ]; then
               echo "🔧 Signing framework binary: $found"
-              retry_codesign "$found" "--timestamp" || retry_codesign "$found" "--timestamp=none" || exit 1
+              retry_codesign "$found" "--timestamp" || exit 1
             else
               echo "⚠️ Aucun binaire exécutable trouvé dans $fw (on signera quand même le .framework)"
             fi
             while IFS= read -r -d '' dylib; do
-              retry_codesign "$dylib" "--timestamp" || retry_codesign "$dylib" "--timestamp=none" || exit 1
+              retry_codesign "$dylib" "--timestamp" || exit 1
             done < <(find "$fw" -type f -name "*.dylib" -print0)
-            retry_codesign "$fw" "--timestamp" || retry_codesign "$fw" "--timestamp=none" || exit 1
+            retry_codesign "$fw" "--timestamp" || exit 1
           done < <(find "$bundle" -type d -name "*.framework" -print0)
 
           # 3) Applications internes (.app)
           while IFS= read -r -d '' app; do
+            echo "📦 Internal .app: $app"
             mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
             if [ -f "$mainexe" ]; then
-              retry_codesign "$mainexe" "--timestamp" || retry_codesign "$mainexe" "--timestamp=none" || exit 1
+              retry_codesign "$mainexe" "--timestamp" || exit 1
             else
               exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
               if [ -n "$exe" ]; then
-                retry_codesign "$exe" "--timestamp" || retry_codesign "$exe" "--timestamp=none" || exit 1
+                retry_codesign "$exe" "--timestamp" || exit 1
               fi
             fi
             while IFS= read -r -d '' dylib; do
-              retry_codesign "$dylib" "--timestamp" || retry_codesign "$dylib" "--timestamp=none" || exit 1
+              retry_codesign "$dylib" "--timestamp" || exit 1
             done < <(find "$app" -type f -name "*.dylib" -print0)
-            retry_codesign "$app" "--timestamp" || retry_codesign "$app" "--timestamp=none" || exit 1
+            retry_codesign "$app" "--timestamp" || exit 1
           done < <(find "$bundle" -type d -name "*.app" -print0)
 
           # 4) Bundles / plugins / kext
           while IFS= read -r -d '' bp; do
+            echo "🔌 Plugin/bundle/kext: $bp"
             exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
             if [ -n "$exe" ]; then
-              retry_codesign "$exe" "--timestamp" || retry_codesign "$exe" "--timestamp=none" || exit 1
+              retry_codesign "$exe" "--timestamp" || exit 1
             fi
-            retry_codesign "$bp" "--timestamp" || retry_codesign "$bp" "--timestamp=none" || exit 1
+            retry_codesign "$bp" "--timestamp" || exit 1
           done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
         done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
@@ -300,7 +272,7 @@ runs:
         # === Étape 3 : signature finale de l’app principale ===
         if [[ "${product_path}" == *.app ]]; then
           echo "📦 Signature finale de l’app principale : ${product_path}"
-          retry_codesign "${product_path}" "--timestamp" || retry_codesign "${product_path}" "--timestamp=none" || exit 1
+          retry_codesign "${product_path}" "--timestamp" || exit 1
         else
           echo "ℹ️ ${product_path} n’est pas un .app, pas de signature racine."
         fi
