@@ -132,6 +132,15 @@ runs:
       run: |
         set -euo pipefail
 
+        # Supprimer signature existante si présente
+        remove_signature() {
+          local target="$1"
+          if codesign -dvv "$target" &>/dev/null; then
+            echo "🧹 Removing existing signature from $target"
+            codesign --remove-signature "$target" || true
+          fi
+        }
+
         retry_codesign() {
           local target="$1"
           local timestamp_flag="$2"
@@ -139,8 +148,10 @@ runs:
           local max_attempts=5
           local delay=5
           while [ $attempt -le $max_attempts ]; do
+            remove_signature "$target"
             echo "[$attempt/$max_attempts] codesign de: $target"
-            output=$(codesign --verbose --deep --strict --options=runtime $timestamp_flag \
+            output=$(codesign --verbose --deep --strict --options=runtime \
+              --timestamp=rfc3161 --ts=https://timestamp.apple.com/ts01 \
               --force --sign "${sign}" --keychain "${keychain}" \
               --entitlements "${entitlements_path}" "$target" 2>&1)
             status=$?
