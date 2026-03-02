@@ -139,43 +139,38 @@ runs:
           local max_attempts=5
           local delay=5
 
-          # Détecter si le fichier est signable
-          signable=true
-          if [[ -f "$target" ]]; then
-            # Ignorer certains fichiers connus non-signables
-            if [[ "$target" == *.pem ]] || [[ "$target" == *.txt ]] || [[ "$target" == *.md ]]; then
-              signable=false
-            fi
-          fi
-
           while [ $attempt -le $max_attempts ]; do
-            if $signable; then
-              remove_signature "$target"
-            fi
             echo "[$attempt/$max_attempts] codesign de: $target"
-            if $signable; then
-              output=$(codesign --verbose --strict --options=runtime $timestamp_flag \
-                --force --sign "${sign}" --keychain "${keychain}" \
-                --entitlements "${entitlements_path}" "$target" 2>&1)
-              status=$?
-            else
-              echo "⚠️ Fichier non-signable ou ignoré pour timestamp : $target"
+
+            # si le fichier n’est pas signable (ex. key.pem), on initialise output vide
+            if [[ ! -x "$target" && "$target" != *.dylib && "$target" != *.so && "$target" != *.app && "$target" != *.bundle && "$target" != *.framework && "$target" != *.plugin && "$target" != *.kext ]]; then
+              output=""
               status=0
+              echo "⚠️ Fichier non-signable ou ignoré pour timestamp : $target"
+            else
+              output=$(codesign --verbose --deep --strict --options=runtime $timestamp_flag \
+                --force --sign "${sign}" --keychain "${keychain}" \
+                --entitlements "${entitlements_path}" "$target" 2>&1) || status=$?
             fi
+
             echo "$output"
-            if [ $status -eq 0 ]; then
+
+            if [ "$status" -eq 0 ]; then
               echo "✅ codesign réussi pour $target"
               return 0
             fi
+
             if echo "$output" | grep -qiE "no identity found|password|resource fork|invalid|not found in keychain|code object is not signed at all"; then
               echo "❌ Erreur fatale détectée, arrêt immédiat."
               return 1
             fi
+
             echo "⚠️ Tentative $attempt échouée, nouvelle tentative dans ${delay}s..."
             attempt=$(( attempt + 1 ))
             sleep $delay
             delay=$(( delay * 2 ))
           done
+
           echo "❌ Échec après $max_attempts tentatives pour $target"
           return 1
         }
