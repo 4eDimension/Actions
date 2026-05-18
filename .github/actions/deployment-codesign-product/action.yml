@@ -378,24 +378,77 @@ runs:
         fi
         echo "🆔 Soumission envoyée, ID=$submission_id"
 
-        # Polling (10s) jusqu'à 1h (360 tentatives)
+        # Polling (20s) jusqu'à 30min (90 tentatives)
         attempt=0
-        max_attempts=360
+        max_attempts=90
+        sleep_interval=20
+        json_error_streak=0
+        json_error_limit=5
         status="In Progress"
+        last_info_stdout_file=""
+        last_info_stderr_file=""
         while [[ "$status" == "In Progress" && $attempt -lt $max_attempts ]]; do
-          sleep 10
+          sleep "$sleep_interval"
           attempt=$((attempt+1))
-          echo "⏳ Vérification notarisation (tentative $attempt)..."
-          out=$(xcrun notarytool info "$submission_id" \
+          echo "⏳ Vérification notarisation (tentative $attempt/$max_attempts)..."
+
+          info_stdout_file="notarytool-info-$attempt.stdout.json"
+          info_stderr_file="notarytool-info-$attempt.stderr.log"
+          last_info_stdout_file="$info_stdout_file"
+          last_info_stderr_file="$info_stderr_file"
+          info_exit_code=0
+
+          set +e
+          xcrun notarytool info "$submission_id" \
             --apple-id "${apple_id}" \
             --team-id "${team_id}" \
             --password "${password}" \
-            --output-format json 2>/dev/null || true)
-          status=$(echo "$out" | jq -r '.status // empty')
-          echo "Statut actuel: ${status:-unknown}"
+            --output-format json >"$info_stdout_file" 2>"$info_stderr_file"
+          info_exit_code=$?
+          set -e
 
-          # Optionnel: écrire l’instantané JSON pour debug
-          echo "$out" > "notarytool-info-$attempt.json" || true
+          echo "↳ notarytool info exit code: $info_exit_code"
+          echo "📄 JSON info brut (stdout):"
+          if [[ -s "$info_stdout_file" ]]; then
+            cat "$info_stdout_file"
+          else
+            echo "<stdout vide>"
+          fi
+
+          echo "🧾 notarytool info stderr:"
+          if [[ -s "$info_stderr_file" ]]; then
+            cat "$info_stderr_file"
+          else
+            echo "<stderr vide>"
+          fi
+
+          if grep -Eiq "error|failed|invalid|unauthorized|forbidden|timeout|timed out|rate limit" "$info_stdout_file" "$info_stderr_file"; then
+            echo "⚠️ Motif d'erreur détecté dans la sortie notarytool (tentative $attempt)."
+          fi
+
+          if [[ -s "$info_stdout_file" ]] && jq -e . "$info_stdout_file" >/dev/null 2>&1; then
+            parsed_status=$(jq -r '.status // empty' "$info_stdout_file")
+            if [[ -n "$parsed_status" ]]; then
+              status="$parsed_status"
+              json_error_streak=0
+            else
+              json_error_streak=$((json_error_streak+1))
+              echo "⚠️ Champ status absent dans le JSON, conservation du statut précédent: ${status:-unknown}"
+              echo "⚠️ Erreurs JSON consécutives: $json_error_streak/$json_error_limit"
+            fi
+          else
+            json_error_streak=$((json_error_streak+1))
+            echo "⚠️ JSON info invalide ou vide, conservation du statut précédent: ${status:-unknown}"
+            echo "⚠️ Erreurs JSON consécutives: $json_error_streak/$json_error_limit"
+          fi
+
+          if [[ $json_error_streak -ge $json_error_limit ]]; then
+            status="JsonErrorThreshold"
+            echo "❌ Échec anticipé: $json_error_streak erreurs JSON consécutives détectées (seuil: $json_error_limit)."
+            break
+          fi
+
+          echo "Statut actuel: ${status:-unknown}"
         done
 
         echo "${status:-Unknown}" > "$status_file"
@@ -411,6 +464,11 @@ runs:
             --team-id "${team_id}" \
             --password "${password}" \
             --output-format json || true
+          exit 1
+        elif [[ "$status" == "JsonErrorThreshold" ]]; then
+          echo "❌ Notarisation interrompue: trop d'erreurs JSON consécutives lors du polling notarytool info."
+          echo "↳ Dernier stdout capturé: ${last_info_stdout_file:-n/a}"
+          echo "↳ Dernier stderr capturé: ${last_info_stderr_file:-n/a}"
           exit 1
         else
           echo "❌ Notarisation non terminée ou statut inattendu: '${status:-Unknown}'"
