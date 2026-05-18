@@ -210,7 +210,7 @@ runs:
           while IFS= read -r -d '' f; do
             echo "🔧 Signing file: $f"
             retry_codesign "$f" "--timestamp" || exit 1
-          done < <(find "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
+          done < <(find -L "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
           # 2) Frameworks
           while IFS= read -r -d '' fw; do
@@ -225,7 +225,12 @@ runs:
               fi
             done
             if [ -z "$found" ]; then
-              found=$(find "$fw" -type f -perm -111 -maxdepth 3 -print -quit || true)
+              # Fallback 1: binaire principal par nom, même sans bit exécutable
+              found=$(find -L "$fw" -maxdepth 5 -type f -name "$fwname" -print -quit || true)
+            fi
+            if [ -z "$found" ]; then
+              # Fallback 2: premier exécutable détecté
+              found=$(find -L "$fw" -maxdepth 5 -type f -perm -111 -print -quit || true)
             fi
             if [ -n "$found" ]; then
               echo "🔧 Signing framework binary: $found"
@@ -235,9 +240,9 @@ runs:
             fi
             while IFS= read -r -d '' dylib; do
               retry_codesign "$dylib" "--timestamp" || exit 1
-            done < <(find "$fw" -type f -name "*.dylib" -print0)
+            done < <(find -L "$fw" -type f -name "*.dylib" -print0)
             retry_codesign "$fw" "--timestamp" || exit 1
-          done < <(find "$bundle" -type d -name "*.framework" -print0)
+          done < <(find -L "$bundle" -type d -name "*.framework" -print0)
 
           # 3) Applications internes (.app)
           while IFS= read -r -d '' app; do
@@ -246,28 +251,33 @@ runs:
             if [ -f "$mainexe" ]; then
               retry_codesign "$mainexe" "--timestamp" || exit 1
             else
-              exe=$(find "$app" -type f -perm -111 -maxdepth 6 -print -quit || true)
+              exe=$(find -L "$app" -maxdepth 6 -type f -perm -111 -print -quit || true)
               if [ -n "$exe" ]; then
                 retry_codesign "$exe" "--timestamp" || exit 1
               fi
             fi
             while IFS= read -r -d '' dylib; do
               retry_codesign "$dylib" "--timestamp" || exit 1
-            done < <(find "$app" -type f -name "*.dylib" -print0)
+            done < <(find -L "$app" -type f -name "*.dylib" -print0)
             retry_codesign "$app" "--timestamp" || exit 1
-          done < <(find "$bundle" -type d -name "*.app" -print0)
+          done < <(find -L "$bundle" -type d -name "*.app" -print0)
 
           # 4) Bundles / plugins / kext
           while IFS= read -r -d '' bp; do
             echo "🔌 Plugin/bundle/kext: $bp"
-            exe=$(find "$bp" -type f -perm -111 -maxdepth 6 -print -quit || true)
+            exe=$(find -L "$bp" -maxdepth 6 -type f -perm -111 -print -quit || true)
             if [ -n "$exe" ]; then
               retry_codesign "$exe" "--timestamp" || exit 1
             fi
             retry_codesign "$bp" "--timestamp" || exit 1
-          done < <(find "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
+          done < <(find -L "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
-        done < <(find "${product_path}" -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0)
+        done < <(
+          if [[ -d "${product_path}" && ( "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ) ]]; then
+            printf '%s\0' "${product_path}"
+          fi
+          find -L "${product_path}" -mindepth 1 -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0
+        )
 
         # === Étape 3 : signature finale de l’app principale ===
         if [[ "${product_path}" == *.app ]]; then
