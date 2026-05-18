@@ -279,6 +279,86 @@ runs:
           find -L "${product_path}" -mindepth 1 -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0
         )
 
+        # === Étape 2.5 : passe de rattrapage des dylibs (Developer ID + timestamp) ===
+        echo "=== Dylib signature sanity pass ==="
+        while IFS= read -r -d '' dylib; do
+          sig_info=$(codesign -dv --verbose=4 "$dylib" 2>&1 || true)
+          has_developer_id=0
+          has_timestamp=0
+
+          if echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+            has_developer_id=1
+          fi
+          if echo "$sig_info" | grep -q "Timestamp="; then
+            has_timestamp=1
+          fi
+
+          if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
+            echo "⚠️ Re-signature requise: $dylib"
+            retry_codesign "$dylib" "--timestamp" || exit 1
+
+            sig_info=$(codesign -dv --verbose=4 "$dylib" 2>&1 || true)
+            if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+              echo "❌ Signature invalide (Developer ID absent) après re-signature: $dylib"
+              exit 1
+            fi
+            if ! echo "$sig_info" | grep -q "Timestamp="; then
+              echo "❌ Signature invalide (timestamp absent) après re-signature: $dylib"
+              exit 1
+            fi
+          fi
+        done < <(find "${product_path}" -type f -name "*.dylib" -print0)
+
+        # === Étape 2.6 : passe de rattrapage des binaires principaux de frameworks ===
+        echo "=== Framework main binary signature sanity pass ==="
+        while IFS= read -r -d '' fw; do
+          fwname="$(basename "$fw" .framework)"
+          main_bin=""
+
+          candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
+          for c in "${candidates[@]}"; do
+            if [ -f "$c" ]; then
+              main_bin="$c"
+              break
+            fi
+          done
+
+          if [[ -z "$main_bin" ]]; then
+            main_bin=$(find -L "$fw" -maxdepth 5 -type f -name "$fwname" -print -quit || true)
+          fi
+
+          if [[ -z "$main_bin" ]]; then
+            echo "⚠️ Impossible d'identifier le binaire principal pour $fw"
+            continue
+          fi
+
+          sig_info=$(codesign -dv --verbose=4 "$main_bin" 2>&1 || true)
+          has_developer_id=0
+          has_timestamp=0
+
+          if echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+            has_developer_id=1
+          fi
+          if echo "$sig_info" | grep -q "Timestamp="; then
+            has_timestamp=1
+          fi
+
+          if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
+            echo "⚠️ Re-signature framework main binary requise: $main_bin"
+            retry_codesign "$main_bin" "--timestamp" || exit 1
+
+            sig_info=$(codesign -dv --verbose=4 "$main_bin" 2>&1 || true)
+            if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+              echo "❌ Signature framework invalide (Developer ID absent) après re-signature: $main_bin"
+              exit 1
+            fi
+            if ! echo "$sig_info" | grep -q "Timestamp="; then
+              echo "❌ Signature framework invalide (timestamp absent) après re-signature: $main_bin"
+              exit 1
+            fi
+          fi
+        done < <(find -L "${product_path}" -type d -name "*.framework" -print0)
+
         # === Étape 3 : signature finale de l’app principale ===
         if [[ "${product_path}" == *.app ]]; then
           echo "📦 Signature finale de l’app principale : ${product_path}"
