@@ -25,7 +25,7 @@ runs:
       shell: bash
 
     - name: Pull latest changes
-      run: git pull origin main
+      run: git pull --rebase origin main
       shell: bash
 
     - name: Fetch remote tags
