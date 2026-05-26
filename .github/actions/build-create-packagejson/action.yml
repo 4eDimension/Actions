@@ -32,7 +32,39 @@ runs:
           git config --global commit.gpgsign false
           git add package.json
           git commit -m "Create package.json"
-          git push origin HEAD:main
+
+          MAX_RETRIES=3
+          ATTEMPT=1
+          while [ "$ATTEMPT" -le "$MAX_RETRIES" ]; do
+            echo "Push attempt $ATTEMPT/$MAX_RETRIES"
+
+            git fetch origin main
+
+            if ! git rebase origin/main; then
+              echo "Rebase failed on attempt $ATTEMPT"
+              git rebase --abort || true
+              if [ "$ATTEMPT" -eq "$MAX_RETRIES" ]; then
+                echo "Unable to rebase after $MAX_RETRIES attempts."
+                exit 1
+              fi
+              sleep $((2 ** ATTEMPT))
+              ATTEMPT=$((ATTEMPT + 1))
+              continue
+            fi
+
+            if git push origin HEAD:main; then
+              echo "Push succeeded."
+              break
+            fi
+
+            if [ "$ATTEMPT" -eq "$MAX_RETRIES" ]; then
+              echo "Unable to push after $MAX_RETRIES attempts."
+              exit 1
+            fi
+
+            sleep $((2 ** ATTEMPT))
+            ATTEMPT=$((ATTEMPT + 1))
+          done
         else
           echo "package.json already exists."
         fi
