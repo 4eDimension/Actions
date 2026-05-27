@@ -86,6 +86,32 @@ runs:
 
     - name: Push commit + tag courant
       run: |
-        git push origin main
-        git push origin ${{ steps.bump.outputs.tag }}
+        # Retry logic pour gérer les erreurs transitoires serveur
+        push_with_retry() {
+          local branch_or_tag="$1"
+          local max_attempts=3
+          local attempt=1
+          local delay=2
+
+          while [ $attempt -le $max_attempts ]; do
+            if git push origin "$branch_or_tag"; then
+              echo "✅ Push de $branch_or_tag réussi"
+              return 0
+            fi
+            
+            if [ $attempt -lt $max_attempts ]; then
+              echo "⚠️ Tentative $attempt échouée, attente ${delay}s avant retry..."
+              sleep $delay
+              delay=$((delay * 2))  # exponential backoff
+              attempt=$((attempt + 1))
+            else
+              echo "❌ Push de $branch_or_tag échoué après $max_attempts tentatives"
+              return 1
+            fi
+          done
+        }
+
+        push_with_retry main || exit 1
+        push_with_retry ${{ steps.bump.outputs.tag }} || exit 1
+        echo "🎉 Tous les pushes réussis"
       shell: bash
