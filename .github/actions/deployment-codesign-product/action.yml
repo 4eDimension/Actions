@@ -449,6 +449,12 @@ runs:
 
         status_file="${GITHUB_WORKSPACE}/notarization_status.txt"
 
+        # Tous les logs passent sur stderr pour ne pas polluer les retours capturés
+        # via $(...) (submission_id / status).
+        log() {
+          echo "$@" >&2
+        }
+
         # ============================================================
         # Fonction 1 : Soumission à NotaryTool avec retry + backoff
         # ============================================================
@@ -462,18 +468,37 @@ runs:
           local submit_max=5
           local submit_delay=1
 
-          echo "📦 Soumission DMG à Apple NotaryTool (timeout=30s, backoff-expo)..."
+          log "📦 Soumission DMG à Apple NotaryTool (timeout=30s, backoff-expo)..."
 
           while [[ $submit_attempt -lt $submit_max ]]; do
             submit_attempt=$((submit_attempt + 1))
             local json_output_file="notarytool-submit-attempt-$submit_attempt.json"
 
-            echo "  [$submit_attempt/$submit_max] notarytool submit..."
+            log "  [$submit_attempt/$submit_max] notarytool submit..."
             local submit_exit_code=0
             local submit_start_time=$(date +%s)
 
             set +e
-            timeout 30s xcrun notarytool submit "$dmg_path"               --apple-id "$apple_id"               --team-id "$team_id"               --password "$password"               --output-format json >"$json_output_file" 2>&1
+            if command -v gtimeout >/dev/null 2>&1; then
+              gtimeout 30s xcrun notarytool submit "$dmg_path" \
+                --apple-id "$apple_id" \
+                --team-id "$team_id" \
+                --password "$password" \
+                --output-format json >"$json_output_file" 2>&1
+            elif command -v timeout >/dev/null 2>&1; then
+              timeout 30s xcrun notarytool submit "$dmg_path" \
+                --apple-id "$apple_id" \
+                --team-id "$team_id" \
+                --password "$password" \
+                --output-format json >"$json_output_file" 2>&1
+            else
+              log "  ⚠️ Ni gtimeout ni timeout disponibles; soumission sans timeout."
+              xcrun notarytool submit "$dmg_path" \
+                --apple-id "$apple_id" \
+                --team-id "$team_id" \
+                --password "$password" \
+                --output-format json >"$json_output_file" 2>&1
+            fi
             submit_exit_code=$?
             set -e
 
@@ -482,23 +507,23 @@ runs:
 
             # Gestion timeout
             if [[ $submit_exit_code -eq 124 ]]; then
-              echo "  ⚠️ Timeout (30s) au bout de ${submit_duration}s, nouvelle tentative dans ${submit_delay}s..."
+              log "  ⚠️ Timeout (30s) au bout de ${submit_duration}s, nouvelle tentative dans ${submit_delay}s..."
               sleep "$submit_delay"
               submit_delay=$((submit_delay * 2))
               continue
             fi
 
             # Afficher JSON pour debug
-            echo "  📄 JSON submit (durée: ${submit_duration}s):"
+            log "  📄 JSON submit (durée: ${submit_duration}s):"
             if [[ -s "$json_output_file" ]]; then
-              cat "$json_output_file" | head -20
+              head -20 "$json_output_file" >&2
             else
-              echo "  <vide>"
+              log "  <vide>"
             fi
 
             # Valider JSON
             if ! jq -e . "$json_output_file" >/dev/null 2>&1; then
-              echo "  ⚠️ JSON invalide, nouvelle tentative dans ${submit_delay}s..."
+              log "  ⚠️ JSON invalide, nouvelle tentative dans ${submit_delay}s..."
               sleep "$submit_delay"
               submit_delay=$((submit_delay * 2))
               continue
@@ -507,7 +532,7 @@ runs:
             # Vérifier que .id existe et est non-null
             local sid=$(jq -r '.id // empty' "$json_output_file")
             if [[ -z "$sid" ]]; then
-              echo "  ⚠️ Champ .id absent ou vide, nouvelle tentative dans ${submit_delay}s..."
+              log "  ⚠️ Champ .id absent ou vide, nouvelle tentative dans ${submit_delay}s..."
               sleep "$submit_delay"
               submit_delay=$((submit_delay * 2))
               continue
@@ -517,20 +542,20 @@ runs:
             local has_error=$(jq -e '.error' "$json_output_file" >/dev/null 2>&1 && echo "1" || echo "0")
             if [[ $has_error -eq 1 ]]; then
               local error_msg=$(jq -r '.error // "unknown"' "$json_output_file")
-              echo "  ⚠️ Erreur Apple: $error_msg, nouvelle tentative dans ${submit_delay}s..."
+              log "  ⚠️ Erreur Apple: $error_msg, nouvelle tentative dans ${submit_delay}s..."
               sleep "$submit_delay"
               submit_delay=$((submit_delay * 2))
               continue
             fi
 
             # ✅ Succès
-            echo "  ✅ Soumission réussie, ID=$sid"
+            log "  ✅ Soumission réussie, ID=$sid"
             echo "$sid"
             return 0
           done
 
           # Échec après $submit_max tentatives
-          echo "  ❌ Submit échoué après $submit_max tentatives"
+          log "  ❌ Submit échoué après $submit_max tentatives"
           return 1
         }
 
@@ -552,20 +577,24 @@ runs:
           local net_error_limit=10
           local status="In Progress"
 
-          echo "⏳ Polling notarytool info (jusqu'à $poll_max tentatives × ${poll_interval}s)..."
+          log "⏳ Polling notarytool info (jusqu'à $poll_max tentatives × ${poll_interval}s)..."
 
           while [[ "$status" == "In Progress" && $poll_attempt -lt $poll_max ]]; do
             sleep "$poll_interval"
             poll_attempt=$((poll_attempt + 1))
 
-            echo "  [$poll_attempt/$poll_max] Vérification notarisation..."
+            log "  [$poll_attempt/$poll_max] Vérification notarisation..."
 
             local info_stdout_file="notarytool-info-$poll_attempt.stdout.json"
             local info_stderr_file="notarytool-info-$poll_attempt.stderr.log"
             local info_exit_code=0
 
             set +e
-            xcrun notarytool info "$submission_id"               --apple-id "$apple_id"               --team-id "$team_id"               --password "$password"               --output-format json >"$info_stdout_file" 2>"$info_stderr_file"
+            xcrun notarytool info "$submission_id" \
+              --apple-id "$apple_id" \
+              --team-id "$team_id" \
+              --password "$password" \
+              --output-format json >"$info_stdout_file" 2>"$info_stderr_file"
             info_exit_code=$?
             set -e
 
@@ -573,9 +602,9 @@ runs:
             if grep -Eiq "NSURLErrorDomain.*-1003|timeout|timed out|server.*hostname.*not found" "$info_stderr_file" 2>/dev/null; then
               net_error_streak=$((net_error_streak + 1))
               app_error_streak=0
-              echo "  ⚠️ Erreur réseau (-1003 ou assimilée), tentative $net_error_streak/$net_error_limit"
+              log "  ⚠️ Erreur réseau (-1003 ou assimilée), tentative $net_error_streak/$net_error_limit"
               if [[ $net_error_streak -ge $net_error_limit ]]; then
-                echo "  ❌ Abandon après $net_error_limit erreurs réseau"
+                log "  ❌ Abandon après $net_error_limit erreurs réseau"
                 status="NetworkError"
                 break
               fi
@@ -589,21 +618,21 @@ runs:
                 status="$parsed_status"
                 app_error_streak=0
                 net_error_streak=0
-                echo "  ✓ Statut: $status"
+                log "  ✓ Statut: $status"
               else
                 app_error_streak=$((app_error_streak + 1))
-                echo "  ⚠️ Champ .status absent, tentative applicative $app_error_streak/$app_error_limit"
+                log "  ⚠️ Champ .status absent, tentative applicative $app_error_streak/$app_error_limit"
                 if [[ $app_error_streak -ge $app_error_limit ]]; then
-                  echo "  ❌ Abandon après $app_error_limit erreurs applicatives"
+                  log "  ❌ Abandon après $app_error_limit erreurs applicatives"
                   status="JsonError"
                   break
                 fi
               fi
             else
               app_error_streak=$((app_error_streak + 1))
-              echo "  ⚠️ JSON invalide/vide, tentative applicative $app_error_streak/$app_error_limit"
+              log "  ⚠️ JSON invalide/vide, tentative applicative $app_error_streak/$app_error_limit"
               if [[ $app_error_streak -ge $app_error_limit ]]; then
-                echo "  ❌ Abandon après $app_error_limit erreurs applicatives"
+                log "  ❌ Abandon après $app_error_limit erreurs applicatives"
                 status="JsonError"
                 break
               fi
@@ -641,20 +670,24 @@ runs:
 
         # 3. Finalisation
         if [[ "$status" == "Accepted" ]]; then
-          echo "✅ Notarisation réussie"
+          log "✅ Notarisation réussie"
           exit 0
         elif [[ "$status" == "Invalid" ]]; then
-          echo "❌ Notarisation rejetée (Invalid)"
-          xcrun notarytool log "$submission_id"             --apple-id "$apple_id"             --team-id "$team_id"             --password "$password"             --output-format json || true
+          log "❌ Notarisation rejetée (Invalid)"
+          xcrun notarytool log "$submission_id" \
+            --apple-id "$apple_id" \
+            --team-id "$team_id" \
+            --password "$password" \
+            --output-format json || true
           exit 1
         elif [[ "$status" == "JsonError" ]]; then
-          echo "❌ Notarisation interrompue: trop d'erreurs JSON lors du polling"
+          log "❌ Notarisation interrompue: trop d'erreurs JSON lors du polling"
           exit 1
         elif [[ "$status" == "NetworkError" ]]; then
-          echo "❌ Notarisation interrompue: erreurs réseau persistantes"
+          log "❌ Notarisation interrompue: erreurs réseau persistantes"
           exit 1
         else
-          echo "❌ Notarisation non terminée ou statut inattendu: '$status'"
+          log "❌ Notarisation non terminée ou statut inattendu: '$status'"
           exit 1
         fi
       env:
