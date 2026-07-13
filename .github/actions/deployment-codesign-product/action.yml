@@ -359,12 +359,26 @@ runs:
           fi
         done < <(find -L "${product_path}" -type d -name "*.framework" -print0)
 
-        # === Étape 3 : signature finale de l’app principale ===
-        if [[ "${product_path}" == *.app ]]; then
-          echo "📦 Signature finale de l’app principale : ${product_path}"
-          retry_codesign "${product_path}" "--timestamp" || exit 1
+        # === Étape 3 : signature finale du bundle racine (app / composant 4D) ===
+        # NB: product_path est fourni avec un "/" final par les workflows appelants ; on le retire
+        # pour que les comparaisons de suffixe (*.app / *.4dbase / *.4darchive) fonctionnent.
+        product_path_trimmed="${product_path%/}"
+        if [[ "${product_path_trimmed}" == *.app ]]; then
+          echo "📦 Signature finale de l’app principale : ${product_path_trimmed}"
+          retry_codesign "${product_path_trimmed}" "--timestamp" || exit 1
+        elif [[ "${product_path_trimmed}" == *.4dbase || "${product_path_trimmed}" == *.4darchive ]]; then
+          # Depuis 4D 20R8, un composant utilisant la structure "Contents/Info.plist" doit être
+          # signé en tant que bundle racine, faute de quoi macOS ne génère jamais
+          # Contents/_CodeSignature ("code object is not signed at all"). Les structures historiques
+          # (plates, sans Contents/Info.plist) ne sont pas concernées et restent inchangées.
+          if [ -f "${product_path_trimmed}/Contents/Info.plist" ]; then
+            echo "📦 Structure Contents/Info.plist détectée — signature finale du bundle : ${product_path_trimmed}"
+            retry_codesign "${product_path_trimmed}" "--timestamp" || exit 1
+          else
+            echo "ℹ️ ${product_path_trimmed} : structure historique (plate, sans Contents/Info.plist) — pas de signature de bundle racine."
+          fi
         else
-          echo "ℹ️ ${product_path} n’est pas un .app, pas de signature racine."
+          echo "ℹ️ ${product_path} n’est pas un .app/.4dbase/.4darchive scellable, pas de signature racine."
         fi
 
       env:
