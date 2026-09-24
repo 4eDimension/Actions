@@ -276,6 +276,25 @@ runs:
             retry_codesign "$app" "--timestamp" "" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.app")
 
+          # 4b) Nested .4DZ (compiled DB ZIP) must be signed before sealing a .4dbase.
+          # On 4D main, Internal User Components ship Contents/*.4DZ; sealing the parent
+          # otherwise fails with: "code object is not signed at all / In subcomponent: …4DZ".
+          # Opaque codesign (no --options=runtime / entitlements) — .4DZ is data, not Mach-O.
+          local dz dz_out dz_status
+          while IFS= read -r dz; do
+            [ -n "$dz" ] || continue
+            echo "📄 Sign nested .4DZ (opaque): $dz"
+            dz_out=$(codesign --force --sign "${sign}" --keychain "${keychain}" --timestamp "$dz" 2>&1)
+            dz_status=$?
+            echo "$dz_out"
+            if [ "$dz_status" -ne 0 ]; then
+              echo "❌ Échec signature opaque .4DZ: $dz"
+              rm -f "$inode_log"
+              return 1
+            fi
+            echo "✅ .4DZ signé: $dz"
+          done < <(deepest_first "$bundle" -type f \( -name "*.4DZ" -o -name "*.4dz" \))
+
           rm -f "$inode_log"
 
           # 5) Sign root MacOS binaries then seal package
