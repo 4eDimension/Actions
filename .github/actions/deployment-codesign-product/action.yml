@@ -198,18 +198,16 @@ runs:
           return 0
         }
 
-        # Sign all codesignable content inside an expanded directory tree (4dbase / 4darchive root)
+        # Sign all codesignable content inside an expanded directory tree (4dbase / 4darchive root).
+        # Order matters: nested frameworks/apps/bundles first, then loose libs, then the root
+        # Contents/MacOS main binary, then seal the bundle. Signing the main Client binary early
+        # (codesign treats it as an app bundle) then mutating nested content invalidates it —
+        # Apple notarize: "The signature of the binary is invalid."
         sign_bundle_tree() {
           local bundle="$1"
           echo "📂 Signing content inside: $bundle"
 
-          # 1) Exécutables simples et libs (.dylib, .so, exécutables)
-          while IFS= read -r -d '' f; do
-            echo "🔧 Signing file: $f"
-            retry_codesign "$f" "--timestamp" || return 1
-          done < <(find -L "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
-
-          # 2) Frameworks
+          # 1) Frameworks (deepest first)
           while IFS= read -r -d '' fw; do
             echo "📘 Framework: $fw"
             local fwname found c
@@ -240,26 +238,7 @@ runs:
             retry_codesign "$fw" "--timestamp" || return 1
           done < <(find -L "$bundle" -type d -name "*.framework" -print0)
 
-          # 3) Applications internes (.app)
-          while IFS= read -r -d '' app; do
-            echo "📦 Internal .app: $app"
-            local mainexe exe
-            mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
-            if [ -f "$mainexe" ]; then
-              retry_codesign "$mainexe" "--timestamp" || return 1
-            else
-              exe=$(find -L "$app" -maxdepth 6 -type f -perm -111 -print -quit || true)
-              if [ -n "$exe" ]; then
-                retry_codesign "$exe" "--timestamp" || return 1
-              fi
-            fi
-            while IFS= read -r -d '' dylib; do
-              retry_codesign "$dylib" "--timestamp" || return 1
-            done < <(find -L "$app" -type f -name "*.dylib" -print0)
-            retry_codesign "$app" "--timestamp" || return 1
-          done < <(find -L "$bundle" -type d -name "*.app" -print0)
-
-          # 4) Bundles / plugins / kext
+          # 2) Bundles / plugins / kext (before internal .app seal where possible)
           while IFS= read -r -d '' bp; do
             echo "🔌 Plugin/bundle/kext: $bp"
             local exe
@@ -270,10 +249,57 @@ runs:
             retry_codesign "$bp" "--timestamp" || return 1
           done < <(find -L "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
-          # Bundle root with Contents/Info.plist (4D 20R8+)
+          # 3) Applications internes (.app) — nested content before main binary / seal
+          while IFS= read -r -d '' app; do
+            echo "📦 Internal .app: $app"
+            local mainexe exe
+            while IFS= read -r -d '' dylib; do
+              retry_codesign "$dylib" "--timestamp" || return 1
+            done < <(find -L "$app" -type f -name "*.dylib" -print0)
+            mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
+            if [ -f "$mainexe" ]; then
+              retry_codesign "$mainexe" "--timestamp" || return 1
+            else
+              exe=$(find -L "$app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit 2>/dev/null || true)
+              if [ -z "$exe" ]; then
+                exe=$(find -L "$app" -maxdepth 6 -type f -perm -111 -print -quit || true)
+              fi
+              if [ -n "$exe" ]; then
+                retry_codesign "$exe" "--timestamp" || return 1
+              fi
+            fi
+            retry_codesign "$app" "--timestamp" || return 1
+          done < <(find -L "$bundle" -type d -name "*.app" -print0)
+
+          # 4) Remaining loose libs / executables — skip nested package trees and root MacOS
+          #    (root MacOS is signed just before the final bundle seal).
+          while IFS= read -r -d '' f; do
+            echo "🔧 Signing file: $f"
+            retry_codesign "$f" "--timestamp" || return 1
+          done < <(
+            find -L "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
+              ! -path "*.framework/*" ! -path "*.app/*" ! -path "*.bundle/*" \
+              ! -path "*.plugin/*" ! -path "*.kext/*" \
+              ! -path "$bundle/Contents/MacOS/*" \
+              -print0
+          )
+
+          # 5) Root Contents/MacOS main binaries (after all nested mutations)
+          if [ -d "$bundle/Contents/MacOS" ]; then
+            while IFS= read -r -d '' mainbin; do
+              echo "🔧 Signing root MacOS binary: $mainbin"
+              retry_codesign "$mainbin" "--timestamp" || return 1
+            done < <(find -L "$bundle/Contents/MacOS" -maxdepth 1 -type f -print0)
+          fi
+
+          # 6) Bundle root with Contents/Info.plist (4D 20R8+ / client .4darchive layout)
           if [ -f "$bundle/Contents/Info.plist" ]; then
             echo "📦 Signature finale du package: $bundle"
             retry_codesign "$bundle" "--timestamp" || return 1
+            if ! codesign --verify --verbose --deep --strict "$bundle" 2>&1; then
+              echo "❌ codesign --verify échoué après signature finale: $bundle"
+              return 1
+            fi
           fi
         }
 
@@ -335,6 +361,13 @@ runs:
             fi
             if ! echo "$sig_info" | grep -q "Timestamp="; then
               echo "❌ Preflight: Timestamp absent: $bin"
+              failures=$((failures + 1))
+              continue
+            fi
+            # codesign -dv can still look "signed" when the hash no longer matches
+            if ! codesign --verify --strict "$bin" >/dev/null 2>&1; then
+              echo "❌ Preflight: codesign --verify failed: $bin"
+              codesign --verify --verbose=4 --strict "$bin" 2>&1 || true
               failures=$((failures + 1))
               continue
             fi
