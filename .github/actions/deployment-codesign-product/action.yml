@@ -170,6 +170,18 @@ runs:
           return 1
         }
 
+        # Windows client archives must not be macOS-codesigned (PE binaries → fatal codesign errors)
+        should_codesign_archive() {
+          local p="$1"
+          local base
+          base="$(basename "$p")"
+          if echo "$base" | grep -qiE '\.win\.4darchive$|^update\.win'; then
+            echo "ℹ️ Skip Windows client archive (no macOS codesign): $p"
+            return 1
+          fi
+          return 0
+        }
+
         # Sign all codesignable content inside an expanded directory tree (4dbase / 4darchive root)
         sign_bundle_tree() {
           local bundle="$1"
@@ -407,6 +419,9 @@ runs:
         }
 
         while IFS= read -r -d '' bundle; do
+          if ! should_codesign_archive "$bundle"; then
+            continue
+          fi
           if [ -d "$bundle" ]; then
             sign_bundle_tree "$bundle" || exit 1
             TREATED_ARCHIVES+=("$bundle")
@@ -433,6 +448,9 @@ runs:
           UPGRADE_DIR="${product_path_trimmed_pre}/Contents/Upgrade4DClient"
           if [ -d "$UPGRADE_DIR" ]; then
             while IFS= read -r -d '' arch; do
+              if ! should_codesign_archive "$arch"; then
+                continue
+              fi
               # Skip if already in TREATED_ARCHIVES
               already=0
               for t in "${TREATED_ARCHIVES[@]+"${TREATED_ARCHIVES[@]}"}"; do
