@@ -162,61 +162,31 @@ runs:
           return 1
         }
 
-        # === Étape 1 : signer tous les binaires, frameworks, bundles, plugins, kexts et apps sauf .4dbase/.4darchive ===
-        echo "=== Signing all main components ==="
-        while IFS= read -r -d '' item; do
-          # ⚡ Fix notarisation : signer les binaires internes des bundles avant le bundle lui-même
-          if [[ "$item" == *.bundle ]]; then
-            for exe in "$item/Contents/MacOS/"*; do
-              if [ -f "$exe" ]; then
-                echo "🔧 Signing internal executable: $exe"
-                retry_codesign "$exe" "--timestamp" || exit 1
-              fi
-            done
-          fi
+        is_zip_file() {
+          local p="$1"
+          [ -f "$p" ] || return 1
+          unzip -t "$p" >/dev/null 2>&1 && return 0
+          file -b "$p" 2>/dev/null | grep -qiE 'Zip archive|ZIP' && return 0
+          return 1
+        }
 
-          # ⚡ Fix sous-apps internes avant de signer une app
-          if [[ "$item" == *.app ]]; then
-            echo "📦 Application détectée : $item"
-            while IFS= read -r -d '' subapp; do
-              echo "  ↳ Sous-app détectée : $subapp"
-              mainexe="$subapp/Contents/MacOS/$(basename "$subapp" .app)"
-              if [ -f "$mainexe" ]; then
-                retry_codesign "$mainexe" "--timestamp" || exit 1
-              else
-                exe=$(find "$subapp" -type f -perm -111 -maxdepth 6 -print -quit || true)
-                if [ -n "$exe" ]; then
-                  retry_codesign "$exe" "--timestamp" || exit 1
-                fi
-              fi
-              retry_codesign "$subapp" "--timestamp" || exit 1
-            done < <(find "$item/Contents/MacOS" -type d -name "*.app" -print0)
-          fi
-
-          retry_codesign "$item" "--timestamp" || exit 1
-        done < <(
-          find "${product_path}" \
-            \( -type f -perm -111 -o -name "*.dylib" -o -name "*.so" \
-              -o -type d -name "*.framework" -o -type d -name "*.bundle" -o -type d -name "*.plugin" -o -type d -name "*.kext" -o -type d -name "*.app" \) \
-            ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
-        )
-
-        # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase) ===
-        echo "=== Signing contents of .4dbase and .4darchive ==="
-        while IFS= read -r -d '' bundle; do
+        # Sign all codesignable content inside an expanded directory tree (4dbase / 4darchive root)
+        sign_bundle_tree() {
+          local bundle="$1"
           echo "📂 Signing content inside: $bundle"
 
           # 1) Exécutables simples et libs (.dylib, .so, exécutables)
           while IFS= read -r -d '' f; do
             echo "🔧 Signing file: $f"
-            retry_codesign "$f" "--timestamp" || exit 1
+            retry_codesign "$f" "--timestamp" || return 1
           done < <(find -L "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
 
           # 2) Frameworks
           while IFS= read -r -d '' fw; do
             echo "📘 Framework: $fw"
+            local fwname found c
             fwname="$(basename "$fw" .framework)"
-            candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
+            local candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
             found=""
             for c in "${candidates[@]}"; do
               if [ -f "$c" ]; then
@@ -225,139 +195,341 @@ runs:
               fi
             done
             if [ -z "$found" ]; then
-              # Fallback 1: binaire principal par nom, même sans bit exécutable
               found=$(find -L "$fw" -maxdepth 5 -type f -name "$fwname" -print -quit || true)
             fi
             if [ -z "$found" ]; then
-              # Fallback 2: premier exécutable détecté
               found=$(find -L "$fw" -maxdepth 5 -type f -perm -111 -print -quit || true)
             fi
             if [ -n "$found" ]; then
               echo "🔧 Signing framework binary: $found"
-              retry_codesign "$found" "--timestamp" || exit 1
+              retry_codesign "$found" "--timestamp" || return 1
             else
               echo "⚠️ Aucun binaire exécutable trouvé dans $fw (on signera quand même le .framework)"
             fi
             while IFS= read -r -d '' dylib; do
-              retry_codesign "$dylib" "--timestamp" || exit 1
+              retry_codesign "$dylib" "--timestamp" || return 1
             done < <(find -L "$fw" -type f -name "*.dylib" -print0)
-            retry_codesign "$fw" "--timestamp" || exit 1
+            retry_codesign "$fw" "--timestamp" || return 1
           done < <(find -L "$bundle" -type d -name "*.framework" -print0)
 
           # 3) Applications internes (.app)
           while IFS= read -r -d '' app; do
             echo "📦 Internal .app: $app"
+            local mainexe exe
             mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
             if [ -f "$mainexe" ]; then
-              retry_codesign "$mainexe" "--timestamp" || exit 1
+              retry_codesign "$mainexe" "--timestamp" || return 1
             else
               exe=$(find -L "$app" -maxdepth 6 -type f -perm -111 -print -quit || true)
               if [ -n "$exe" ]; then
-                retry_codesign "$exe" "--timestamp" || exit 1
+                retry_codesign "$exe" "--timestamp" || return 1
               fi
             fi
             while IFS= read -r -d '' dylib; do
-              retry_codesign "$dylib" "--timestamp" || exit 1
+              retry_codesign "$dylib" "--timestamp" || return 1
             done < <(find -L "$app" -type f -name "*.dylib" -print0)
-            retry_codesign "$app" "--timestamp" || exit 1
+            retry_codesign "$app" "--timestamp" || return 1
           done < <(find -L "$bundle" -type d -name "*.app" -print0)
 
           # 4) Bundles / plugins / kext
           while IFS= read -r -d '' bp; do
             echo "🔌 Plugin/bundle/kext: $bp"
+            local exe
             exe=$(find -L "$bp" -maxdepth 6 -type f -perm -111 -print -quit || true)
             if [ -n "$exe" ]; then
-              retry_codesign "$exe" "--timestamp" || exit 1
+              retry_codesign "$exe" "--timestamp" || return 1
             fi
-            retry_codesign "$bp" "--timestamp" || exit 1
+            retry_codesign "$bp" "--timestamp" || return 1
           done < <(find -L "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
 
-        done < <(
+          # Bundle root with Contents/Info.plist (4D 20R8+)
+          if [ -f "$bundle/Contents/Info.plist" ]; then
+            echo "📦 Signature finale du package: $bundle"
+            retry_codesign "$bundle" "--timestamp" || return 1
+          fi
+        }
+
+        # Expand ZIP .4darchive → sign tree → recompress in place (keeps file format for 4D auto-update)
+        prepare_and_sign_zip_4darchive() {
+          local archive="$1"
+          local work extract_root out_tmp
+          echo "📦 prepare_4darchive: ZIP detecté → extract / sign / recompress: $archive"
+          work=$(mktemp -d /tmp/4darchive-sign.XXXXXX)
+          extract_root="$work/root"
+          mkdir -p "$extract_root"
+          if ! ditto -x -k "$archive" "$extract_root" 2>/dev/null; then
+            echo "⚠️ ditto -x -k a échoué, fallback unzip"
+            unzip -qo "$archive" -d "$extract_root"
+          fi
+          # If zip wrapped a single top-level folder, sign that folder; else sign extract root
+          local sign_root="$extract_root"
+          local top_count
+          top_count=$(find "$extract_root" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+          if [ "$top_count" = "1" ]; then
+            local only
+            only=$(find "$extract_root" -mindepth 1 -maxdepth 1 -print -quit)
+            if [ -d "$only" ]; then
+              sign_root="$only"
+            fi
+          fi
+          sign_bundle_tree "$sign_root" || { rm -rf "$work"; return 1; }
+          out_tmp="${archive}.signed.tmp.zip"
+          rm -f "$out_tmp"
+          # Archive contents of extract_root (preserve original zip layout)
+          if ! ditto -c -k --sequesterRsrc "$extract_root" "$out_tmp" 2>/dev/null; then
+            echo "⚠️ ditto -c -k a échoué, fallback zip"
+            (cd "$extract_root" && zip -r -y -q "$out_tmp" .)
+          fi
+          mv -f "$out_tmp" "$archive"
+          xattr -cr "$archive" 2>/dev/null || true
+          rm -rf "$work"
+          echo "✅ prepare_4darchive: recompress OK → $archive"
+        }
+
+        verify_macho_signatures_under() {
+          local root="$1"
+          local label="$2"
+          local failures=0
+          local checked=0
+          echo "=== Preflight signatures ($label): $root ==="
+          while IFS= read -r -d '' bin; do
+            # Limit to Mach-O / likely signed payloads
+            if ! file -b "$bin" 2>/dev/null | grep -qiE 'Mach-O|shared library|bundle|executable'; then
+              continue
+            fi
+            checked=$((checked + 1))
+            local sig_info
+            sig_info=$(codesign -dv --verbose=4 "$bin" 2>&1 || true)
+            if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+              echo "❌ Preflight: Developer ID absent: $bin"
+              failures=$((failures + 1))
+              continue
+            fi
+            if ! echo "$sig_info" | grep -q "Timestamp="; then
+              echo "❌ Preflight: Timestamp absent: $bin"
+              failures=$((failures + 1))
+              continue
+            fi
+          done < <(find -L "$root" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0)
+
+          echo "Preflight $label: checked=$checked failures=$failures"
+          if [ "$failures" -gt 0 ]; then
+            echo "❌ Preflight échoué pour $label ($failures binaire(s))"
+            return 1
+          fi
+          if [ "$checked" -eq 0 ]; then
+            echo "⚠️ Preflight: aucun Mach-O trouvé sous $root (peut être normal pour un 4dbase sans lib native)"
+          fi
+          return 0
+        }
+
+        preflight_archive_path() {
+          local archive="$1"
+          if [ -d "$archive" ]; then
+            verify_macho_signatures_under "$archive" "dir:$archive" || return 1
+          elif is_zip_file "$archive"; then
+            local work
+            work=$(mktemp -d /tmp/4darchive-preflight.XXXXXX)
+            if ! ditto -x -k "$archive" "$work" 2>/dev/null; then
+              unzip -qo "$archive" -d "$work"
+            fi
+            verify_macho_signatures_under "$work" "zip:$archive" || { rm -rf "$work"; return 1; }
+            rm -rf "$work"
+          else
+            echo "⚠️ Preflight: type non géré pour $archive"
+          fi
+        }
+
+        # === Étape 1 : signer tous les binaires, frameworks, bundles, plugins, kexts et apps sauf .4dbase/.4darchive ===
+        # Skip when product_path is itself a ZIP file (Archive Client path)
+        if [ -d "${product_path}" ]; then
+          echo "=== Signing all main components ==="
+          while IFS= read -r -d '' item; do
+            # ⚡ Fix notarisation : signer les binaires internes des bundles avant le bundle lui-même
+            if [[ "$item" == *.bundle ]]; then
+              for exe in "$item/Contents/MacOS/"*; do
+                if [ -f "$exe" ]; then
+                  echo "🔧 Signing internal executable: $exe"
+                  retry_codesign "$exe" "--timestamp" || exit 1
+                fi
+              done
+            fi
+
+            # ⚡ Fix sous-apps internes avant de signer une app
+            if [[ "$item" == *.app ]]; then
+              echo "📦 Application détectée : $item"
+              while IFS= read -r -d '' subapp; do
+                echo "  ↳ Sous-app détectée : $subapp"
+                mainexe="$subapp/Contents/MacOS/$(basename "$subapp" .app)"
+                if [ -f "$mainexe" ]; then
+                  retry_codesign "$mainexe" "--timestamp" || exit 1
+                else
+                  exe=$(find "$subapp" -type f -perm -111 -maxdepth 6 -print -quit || true)
+                  if [ -n "$exe" ]; then
+                    retry_codesign "$exe" "--timestamp" || exit 1
+                  fi
+                fi
+                retry_codesign "$subapp" "--timestamp" || exit 1
+              done < <(find "$item/Contents/MacOS" -type d -name "*.app" -print0)
+            fi
+
+            retry_codesign "$item" "--timestamp" || exit 1
+          done < <(
+            find "${product_path}" \
+              \( -type f -perm -111 -o -name "*.dylib" -o -name "*.so" \
+                -o -type d -name "*.framework" -o -type d -name "*.bundle" -o -type d -name "*.plugin" -o -type d -name "*.kext" -o -type d -name "*.app" \) \
+              ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
+          )
+        else
+          echo "=== Skipping étape 1 (product_path is not a directory): ${product_path} ==="
+        fi
+
+        # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase), y compris ZIP ===
+        echo "=== Signing contents of .4dbase and .4darchive ==="
+        TREATED_ARCHIVES=()
+
+        collect_and_sign_archives() {
+          local path
+          # product_path itself is a directory package
           if [[ -d "${product_path}" && ( "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ) ]]; then
             printf '%s\0' "${product_path}"
           fi
-          find -L "${product_path}" -mindepth 1 -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0
-        )
+          # product_path itself is a ZIP .4darchive / .4dbase
+          if [[ -f "${product_path}" && ( "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ) ]]; then
+            printf '%s\0' "${product_path}"
+          fi
+          if [ -d "${product_path}" ]; then
+            # Nested directory packages
+            find -L "${product_path}" -mindepth 1 -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0
+            # Nested ZIP archives (e.g. Upgrade4DClient/update.mac.4darchive)
+            find -L "${product_path}" -mindepth 1 -type f \( -name "*.4darchive" -o -name "*.4dbase" \) -print0
+          fi
+        }
+
+        while IFS= read -r -d '' bundle; do
+          if [ -d "$bundle" ]; then
+            sign_bundle_tree "$bundle" || exit 1
+            TREATED_ARCHIVES+=("$bundle")
+          elif is_zip_file "$bundle"; then
+            prepare_and_sign_zip_4darchive "$bundle" || exit 1
+            TREATED_ARCHIVES+=("$bundle")
+          else
+            echo "⚠️ Ignoré (ni dossier ni ZIP): $bundle"
+          fi
+        done < <(collect_and_sign_archives)
+
+        # === Preflight: fail fast before DMG/notary if nested archives still unsigned ===
+        echo "=== Preflight nested archives after signing ==="
+        if [ "${#TREATED_ARCHIVES[@]}" -gt 0 ]; then
+          for arch in "${TREATED_ARCHIVES[@]}"; do
+            preflight_archive_path "$arch" || exit 1
+          done
+        else
+          echo "ℹ️ Aucune archive .4dbase/.4darchive traitée"
+        fi
+        # Extra: any Upgrade4DClient archives under a .app that might have been missed
+        product_path_trimmed_pre="${product_path%/}"
+        if [[ "${product_path_trimmed_pre}" == *.app ]]; then
+          UPGRADE_DIR="${product_path_trimmed_pre}/Contents/Upgrade4DClient"
+          if [ -d "$UPGRADE_DIR" ]; then
+            while IFS= read -r -d '' arch; do
+              # Skip if already in TREATED_ARCHIVES
+              already=0
+              for t in "${TREATED_ARCHIVES[@]+"${TREATED_ARCHIVES[@]}"}"; do
+                [ "$t" = "$arch" ] && already=1 && break
+              done
+              if [ "$already" -eq 0 ]; then
+                echo "⚠️ Archive Upgrade4DClient non traitée en étape 2, preflight seul: $arch"
+                preflight_archive_path "$arch" || exit 1
+              fi
+            done < <(find "$UPGRADE_DIR" \( -type d -o -type f \) -name '*.4darchive' -print0)
+          fi
+        fi
 
         # === Étape 2.5 : passe de rattrapage des dylibs (Developer ID + timestamp) ===
-        echo "=== Dylib signature sanity pass ==="
-        while IFS= read -r -d '' dylib; do
-          sig_info=$(codesign -dv --verbose=4 "$dylib" 2>&1 || true)
-          has_developer_id=0
-          has_timestamp=0
-
-          if echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
-            has_developer_id=1
-          fi
-          if echo "$sig_info" | grep -q "Timestamp="; then
-            has_timestamp=1
-          fi
-
-          if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
-            echo "⚠️ Re-signature requise: $dylib"
-            retry_codesign "$dylib" "--timestamp" || exit 1
-
+        # Uniquement sur arbres disque (pas à l'intérieur des ZIP déjà recompressés)
+        if [ -d "${product_path}" ]; then
+          echo "=== Dylib signature sanity pass ==="
+          while IFS= read -r -d '' dylib; do
             sig_info=$(codesign -dv --verbose=4 "$dylib" 2>&1 || true)
-            if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
-              echo "❌ Signature invalide (Developer ID absent) après re-signature: $dylib"
-              exit 1
+            has_developer_id=0
+            has_timestamp=0
+
+            if echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+              has_developer_id=1
             fi
-            if ! echo "$sig_info" | grep -q "Timestamp="; then
-              echo "❌ Signature invalide (timestamp absent) après re-signature: $dylib"
-              exit 1
+            if echo "$sig_info" | grep -q "Timestamp="; then
+              has_timestamp=1
             fi
-          fi
-        done < <(find "${product_path}" -type f -name "*.dylib" -print0)
 
-        # === Étape 2.6 : passe de rattrapage des binaires principaux de frameworks ===
-        echo "=== Framework main binary signature sanity pass ==="
-        while IFS= read -r -d '' fw; do
-          fwname="$(basename "$fw" .framework)"
-          main_bin=""
+            if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
+              echo "⚠️ Re-signature requise: $dylib"
+              retry_codesign "$dylib" "--timestamp" || exit 1
 
-          candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
-          for c in "${candidates[@]}"; do
-            if [ -f "$c" ]; then
-              main_bin="$c"
-              break
+              sig_info=$(codesign -dv --verbose=4 "$dylib" 2>&1 || true)
+              if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+                echo "❌ Signature invalide (Developer ID absent) après re-signature: $dylib"
+                exit 1
+              fi
+              if ! echo "$sig_info" | grep -q "Timestamp="; then
+                echo "❌ Signature invalide (timestamp absent) après re-signature: $dylib"
+                exit 1
+              fi
             fi
-          done
+          done < <(find "${product_path}" -type f -name "*.dylib" ! -path "*.4darchive/*" ! -path "*.4dbase/*" -print0)
 
-          if [[ -z "$main_bin" ]]; then
-            main_bin=$(find -L "$fw" -maxdepth 5 -type f -name "$fwname" -print -quit || true)
-          fi
+          # === Étape 2.6 : passe de rattrapage des binaires principaux de frameworks ===
+          echo "=== Framework main binary signature sanity pass ==="
+          while IFS= read -r -d '' fw; do
+            fwname="$(basename "$fw" .framework)"
+            main_bin=""
 
-          if [[ -z "$main_bin" ]]; then
-            echo "⚠️ Impossible d'identifier le binaire principal pour $fw"
-            continue
-          fi
+            candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
+            for c in "${candidates[@]}"; do
+              if [ -f "$c" ]; then
+                main_bin="$c"
+                break
+              fi
+            done
 
-          sig_info=$(codesign -dv --verbose=4 "$main_bin" 2>&1 || true)
-          has_developer_id=0
-          has_timestamp=0
+            if [[ -z "$main_bin" ]]; then
+              main_bin=$(find -L "$fw" -maxdepth 5 -type f -name "$fwname" -print -quit || true)
+            fi
 
-          if echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
-            has_developer_id=1
-          fi
-          if echo "$sig_info" | grep -q "Timestamp="; then
-            has_timestamp=1
-          fi
-
-          if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
-            echo "⚠️ Re-signature framework main binary requise: $main_bin"
-            retry_codesign "$main_bin" "--timestamp" || exit 1
+            if [[ -z "$main_bin" ]]; then
+              echo "⚠️ Impossible d'identifier le binaire principal pour $fw"
+              continue
+            fi
 
             sig_info=$(codesign -dv --verbose=4 "$main_bin" 2>&1 || true)
-            if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
-              echo "❌ Signature framework invalide (Developer ID absent) après re-signature: $main_bin"
-              exit 1
+            has_developer_id=0
+            has_timestamp=0
+
+            if echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+              has_developer_id=1
             fi
-            if ! echo "$sig_info" | grep -q "Timestamp="; then
-              echo "❌ Signature framework invalide (timestamp absent) après re-signature: $main_bin"
-              exit 1
+            if echo "$sig_info" | grep -q "Timestamp="; then
+              has_timestamp=1
             fi
-          fi
-        done < <(find -L "${product_path}" -type d -name "*.framework" -print0)
+
+            if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
+              echo "⚠️ Re-signature framework main binary requise: $main_bin"
+              retry_codesign "$main_bin" "--timestamp" || exit 1
+
+              sig_info=$(codesign -dv --verbose=4 "$main_bin" 2>&1 || true)
+              if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
+                echo "❌ Signature framework invalide (Developer ID absent) après re-signature: $main_bin"
+                exit 1
+              fi
+              if ! echo "$sig_info" | grep -q "Timestamp="; then
+                echo "❌ Signature framework invalide (timestamp absent) après re-signature: $main_bin"
+                exit 1
+              fi
+            fi
+          done < <(find -L "${product_path}" -type d -name "*.framework" ! -path "*.4darchive/*" ! -path "*.4dbase/*" -print0)
+        else
+          echo "=== Skipping dylib/framework sanity passes (product_path is not a directory) ==="
+        fi
 
         # === Étape 3 : signature finale du bundle racine (app / composant 4D) ===
         # NB: product_path est fourni avec un "/" final par les workflows appelants ; on le retire
@@ -366,7 +538,7 @@ runs:
         if [[ "${product_path_trimmed}" == *.app ]]; then
           echo "📦 Signature finale de l’app principale : ${product_path_trimmed}"
           retry_codesign "${product_path_trimmed}" "--timestamp" || exit 1
-        elif [[ "${product_path_trimmed}" == *.4dbase || "${product_path_trimmed}" == *.4darchive ]]; then
+        elif [[ -d "${product_path_trimmed}" && ( "${product_path_trimmed}" == *.4dbase || "${product_path_trimmed}" == *.4darchive ) ]]; then
           # Depuis 4D 20R8, un composant utilisant la structure "Contents/Info.plist" doit être
           # signé en tant que bundle racine, faute de quoi macOS ne génère jamais
           # Contents/_CodeSignature ("code object is not signed at all"). Les structures historiques
@@ -377,6 +549,8 @@ runs:
           else
             echo "ℹ️ ${product_path_trimmed} : structure historique (plate, sans Contents/Info.plist) — pas de signature de bundle racine."
           fi
+        elif [[ -f "${product_path_trimmed}" && ( "${product_path_trimmed}" == *.4dbase || "${product_path_trimmed}" == *.4darchive ) ]]; then
+          echo "ℹ️ ${product_path_trimmed} : archive ZIP — signature racine non applicable (contenu déjà signé + recompressé)."
         else
           echo "ℹ️ ${product_path} n’est pas un .app/.4dbase/.4darchive scellable, pas de signature racine."
         fi
