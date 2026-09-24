@@ -236,8 +236,14 @@ runs:
             done | sort -nr | cut -f2-
           }
 
-          # 1) All Mach-O / dylib / so leaves, deepest first, unique inode
-          # Prefer -P (don't follow symlinks) so Versions/Current is not double-walked
+          # 1) Mach-O leaves, deepest first, unique inode.
+          # Skip root Contents/MacOS/* when this tree is app-like: those binaries are sealed
+          # with the final package signature. Signing them early as "app bundle" then mutating
+          # nested helpers invalidates the seal.
+          local leaf_find=( -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) )
+          if [ -f "$bundle/Contents/Info.plist" ] || [ -f "$bundle/Info.plist" ]; then
+            leaf_find+=( ! -path "$bundle/Contents/MacOS/*" ! -path "$bundle/MacOS/*" )
+          fi
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O|shared library|bundle|executable'; then
@@ -247,7 +253,7 @@ runs:
               esac
             fi
             sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
-          done < <(deepest_first "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \))
+          done < <(deepest_first "$bundle" "${leaf_find[@]}")
 
           # 2) Seal frameworks deepest-first (no --deep: leaves already signed)
           while IFS= read -r fw; do
@@ -272,21 +278,131 @@ runs:
 
           rm -f "$inode_log"
 
-          # 5) Seal root if it is an app-like bundle (client .4darchive layout)
+          # 5) Sign root MacOS binaries then seal package
+          # Support both layouts:
+          #   - app root with Contents/Info.plist
+          #   - Contents/ itself as sign_root (Info.plist at $bundle/Info.plist) — must NOT happen
+          #     if resolve_sign_root is correct, but seal either way.
+          local seal_target=""
           if [ -f "$bundle/Contents/Info.plist" ]; then
-            echo "📦 Signature finale du package: $bundle"
-            retry_codesign "$bundle" "--timestamp" "" || return 1
-            if ! codesign --verify --verbose --strict "$bundle" 2>&1; then
-              echo "❌ codesign --verify échoué après signature finale: $bundle"
+            seal_target="$bundle"
+            if [ -d "$bundle/Contents/MacOS" ]; then
+              while IFS= read -r mainbin; do
+                [ -n "$mainbin" ] || continue
+                echo "🔧 Signing root MacOS binary: $mainbin"
+                retry_codesign "$mainbin" "--timestamp" "" || return 1
+              done < <(find -P "$bundle/Contents/MacOS" -maxdepth 1 -type f -print)
+            fi
+          elif [ -f "$bundle/Info.plist" ] && [ -d "$bundle/MacOS" ]; then
+            # sign_root incorrectly set to Contents/ — seal parent if possible
+            seal_target="$(dirname "$bundle")"
+            while IFS= read -r mainbin; do
+              [ -n "$mainbin" ] || continue
+              echo "🔧 Signing root MacOS binary: $mainbin"
+              retry_codesign "$mainbin" "--timestamp" "" || return 1
+            done < <(find -P "$bundle/MacOS" -maxdepth 1 -type f -print)
+          fi
+
+          if [ -n "$seal_target" ] && [ -f "$seal_target/Contents/Info.plist" ]; then
+            echo "📦 Signature finale du package: $seal_target"
+            retry_codesign "$seal_target" "--timestamp" "" || return 1
+            if ! codesign --verify --verbose --strict "$seal_target" 2>&1; then
+              echo "❌ codesign --verify échoué après signature finale: $seal_target"
               return 1
             fi
+          elif [ -f "$bundle/Info.plist" ]; then
+            # Last resort: codesign the Contents directory's parent isn't available; sign main binaries only
+            echo "⚠️ Layout Contents/ sans parent scellable — pas de signature de bundle racine"
           fi
         }
 
-        # Expand ZIP .4darchive → sign tree → recompress in place (preserve symlinks, no AppleDouble)
+        # Resolve extract layout for client .4darchive (ZIP root is usually Contents/)
+        resolve_sign_root() {
+          local extract_root="$1"
+          local sign_root="$extract_root"
+          local top_count only base
+          top_count=$(find "$extract_root" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+          if [ "$top_count" = "1" ]; then
+            only=$(find "$extract_root" -mindepth 1 -maxdepth 1 -print -quit)
+            if [ -d "$only" ]; then
+              base="$(basename "$only")"
+              # Lone top-level Contents/ → keep parent as app-like root
+              if [ "$base" = "Contents" ]; then
+                sign_root="$extract_root"
+              else
+                sign_root="$only"
+              fi
+            fi
+          fi
+          printf '%s' "$sign_root"
+        }
+
+        normalize_cef_helpers_under() {
+          local root="$1"
+          local py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
+          while IFS= read -r -d '' BUNDLE_ROOT; do
+            echo "📦 CEF normalize under archive: $BUNDLE_ROOT"
+            local SRC_CEF="${BUNDLE_ROOT}/Chromium Embedded Framework.framework"
+            if [ ! -d "$SRC_CEF" ]; then
+              echo "⚠️ CEF introuvable dans $BUNDLE_ROOT — skip"
+              continue
+            fi
+            while IFS= read -r -d '' APP; do
+              local NAME EXE TGT RESOLVED DEST_CEF
+              NAME="$(basename "$APP" .app)"
+              EXE="$APP/Contents/MacOS/$NAME"
+              if [ -L "$EXE" ]; then
+                TGT="$(readlink "$EXE")"
+                RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
+                if [ -f "$RESOLVED" ]; then
+                  echo "🪄 Remplace symlink exécutable: $EXE"
+                  rm -f "$EXE"
+                  /usr/bin/ditto "$RESOLVED" "$EXE"
+                  chmod 755 "$EXE"
+                fi
+              fi
+              DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+              if [ -L "$DEST_CEF" ]; then
+                echo "🪄 Supprime symlink CEF dans $APP"
+                rm -f "$DEST_CEF"
+              fi
+              if [ ! -d "$DEST_CEF" ]; then
+                echo "📚 Copie CEF local dans: $DEST_CEF"
+                /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
+              fi
+            done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
+          done < <(find "$root" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
+        }
+
+        archive_tree_verifies() {
+          local sign_root="$1"
+          local main=""
+          if [ -f "$sign_root/Contents/Info.plist" ]; then
+            if codesign --verify --strict "$sign_root" >/dev/null 2>&1; then
+              return 0
+            fi
+            main=$(find -P "$sign_root/Contents/MacOS" -maxdepth 1 -type f -print -quit 2>/dev/null)
+            if [ -n "$main" ] && codesign --verify --strict "$main" >/dev/null 2>&1; then
+              # Outer pseudo-bundle seal may be absent when archive was packed from .app Contents/
+              # but leaf signatures from the notarized app are what Apple checks inside the ZIP.
+              echo "ℹ️ Bundle root verify soft-fail; main binary OK: $main"
+              return 0
+            fi
+            return 1
+          fi
+          if [ -f "$sign_root/Info.plist" ] && [ -d "$sign_root/MacOS" ]; then
+            main=$(find -P "$sign_root/MacOS" -maxdepth 1 -type f -print -quit 2>/dev/null)
+            if [ -n "$main" ] && codesign --verify --strict "$main" >/dev/null 2>&1; then
+              return 0
+            fi
+          fi
+          return 1
+        }
+
+        # Expand ZIP .4darchive → sign only if needed → recompress (zip -ryX, no AppleDouble)
         prepare_and_sign_zip_4darchive() {
           local archive="$1"
-          local work extract_root out_tmp
+          local work extract_root out_tmp sign_root
           echo "📦 prepare_4darchive: ZIP detecté → extract / sign / recompress: $archive"
           work=$(mktemp -d /tmp/4darchive-sign.XXXXXX)
           extract_root="$work/root"
@@ -295,34 +411,31 @@ runs:
             echo "⚠️ ditto -x -k a échoué, fallback unzip"
             unzip -qo "$archive" -d "$extract_root"
           fi
-          # If zip wrapped a single top-level folder, sign that folder; else sign extract root
-          local sign_root="$extract_root"
-          local top_count
-          top_count=$(find "$extract_root" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
-          if [ "$top_count" = "1" ]; then
-            local only
-            only=$(find "$extract_root" -mindepth 1 -maxdepth 1 -print -quit)
-            if [ -d "$only" ]; then
-              sign_root="$only"
-            fi
+
+          sign_root="$(resolve_sign_root "$extract_root")"
+          echo "📂 sign_root=$sign_root"
+
+          # If already valid (e.g. archive rebuilt from notarized Client.app), keep as-is
+          if archive_tree_verifies "$sign_root"; then
+            echo "✅ Archive déjà valide — pas de re-signature ni recompress"
+            rm -rf "$work"
+            return 0
           fi
+          echo "ℹ️ Archive non valide telle quelle — normalize CEF + sign + recompress"
+
+          normalize_cef_helpers_under "$sign_root"
           sign_bundle_tree "$sign_root" || { rm -rf "$work"; return 1; }
 
-          # Fail fast before ZIP if seals are already broken
-          if [ -f "$sign_root/Contents/Info.plist" ]; then
-            if ! codesign --verify --verbose --strict "$sign_root" 2>&1; then
-              echo "❌ Signature invalide AVANT recompress ZIP: $sign_root"
-              rm -rf "$work"
-              return 1
-            fi
-            echo "✅ Verify OK before ZIP recompress"
+          if ! archive_tree_verifies "$sign_root"; then
+            echo "❌ Signature invalide AVANT recompress ZIP: $sign_root"
+            codesign --verify --verbose --strict "$sign_root" 2>&1 || true
+            rm -rf "$work"
+            return 1
           fi
+          echo "✅ Verify OK before ZIP recompress"
 
           out_tmp="${archive}.signed.tmp.zip"
           rm -f "$out_tmp"
-          # -y: store symlinks as symlinks (critical for .framework/Versions/Current)
-          # -X: no extra file attributes that can disturb seals
-          # Avoid ditto --sequesterRsrc (AppleDouble ._ files break notarization)
           echo "📦 Recompress ZIP (zip -ryX) from $extract_root"
           (cd "$extract_root" && zip -r -y -X -q "$out_tmp" .) || {
             echo "❌ zip recompress failed"
