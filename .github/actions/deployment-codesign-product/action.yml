@@ -276,24 +276,47 @@ runs:
             retry_codesign "$app" "--timestamp" "" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.app")
 
-          # 4b) Nested .4DZ (compiled DB ZIP) must be signed before sealing a .4dbase.
-          # On 4D main, Internal User Components ship Contents/*.4DZ; sealing the parent
-          # otherwise fails with: "code object is not signed at all / In subcomponent: …4DZ".
-          # Opaque codesign (no --options=runtime / entitlements) — .4DZ is data, not Mach-O.
-          local dz dz_out dz_status
-          while IFS= read -r dz; do
-            [ -n "$dz" ] || continue
-            echo "📄 Sign nested .4DZ (opaque): $dz"
-            dz_out=$(codesign --force --sign "${sign}" --keychain "${keychain}" --timestamp "$dz" 2>&1)
-            dz_status=$?
-            echo "$dz_out"
-            if [ "$dz_status" -ne 0 ]; then
-              echo "❌ Échec signature opaque .4DZ: $dz"
-              rm -f "$inode_log"
+          # 4b) Opaque-sign non-Mach-O nested payloads before sealing a .4dbase/.bundle.
+          # Apple treats unexpected files directly under Contents/ as nested code objects
+          # ("code object is not signed at all / In subcomponent: …"). Seen on 4D main:
+          #   - Contents/*.4DZ (Internal User Components)
+          #   - Contents/README.md (Internal Components/runtime.4dbase)
+          # No --options=runtime / entitlements — these are data files, not executables.
+          sign_opaque() {
+            local target="$1"
+            local out st
+            echo "📄 Sign opaque: $target"
+            out=$(codesign --force --sign "${sign}" --keychain "${keychain}" --timestamp "$target" 2>&1)
+            st=$?
+            echo "$out"
+            if [ "$st" -ne 0 ]; then
+              echo "❌ Échec signature opaque: $target"
               return 1
             fi
-            echo "✅ .4DZ signé: $dz"
+            echo "✅ Opaque signé: $target"
+            return 0
+          }
+
+          local opaque_f base
+          while IFS= read -r opaque_f; do
+            [ -n "$opaque_f" ] || continue
+            sign_opaque "$opaque_f" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -name "*.4DZ" -o -name "*.4dz" \))
+
+          if [ -d "$bundle/Contents" ]; then
+            while IFS= read -r opaque_f; do
+              [ -n "$opaque_f" ] || continue
+              base="$(basename "$opaque_f")"
+              case "$base" in
+                Info.plist|PkgInfo|CodeResources) continue ;;
+              esac
+              # Skip if already signed above as .4DZ (re-sign is harmless but noisy)
+              case "$opaque_f" in
+                *.4DZ|*.4dz) continue ;;
+              esac
+              sign_opaque "$opaque_f" || { rm -f "$inode_log"; return 1; }
+            done < <(find -P "$bundle/Contents" -maxdepth 1 -type f -print)
+          fi
 
           rm -f "$inode_log"
 
