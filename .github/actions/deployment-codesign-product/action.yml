@@ -148,15 +148,20 @@ runs:
           esac
         }
 
+        # codesign: never use --deep on leaf Mach-O files. --deep on Contents/MacOS/<app>
+        # seals the whole bundle; later mutations (or hardlinked CEF copies) invalidate it.
+        # Use deep only when sealing a bundle/framework container.
         retry_codesign() {
           local target="$1"
           local timestamp_flag="$2"
+          local deep_flag="${3:-}"
           local attempt=1
           local max_attempts=5
           local delay=5
           while [ $attempt -le $max_attempts ]; do
-            echo "[$attempt/$max_attempts] codesign de: $target"
-            output=$(codesign --verbose --deep --strict --options=runtime $timestamp_flag \
+            echo "[$attempt/$max_attempts] codesign ${deep_flag:-} de: $target"
+            # shellcheck disable=SC2086
+            output=$(codesign --verbose --strict --options=runtime $deep_flag $timestamp_flag \
               --force --sign "${sign}" --keychain "${keychain}" \
               --entitlements "${entitlements_path}" "$target" 2>&1)
             status=$?
@@ -198,112 +203,87 @@ runs:
           return 0
         }
 
-        # Sign all codesignable content inside an expanded directory tree (4dbase / 4darchive root).
-        # Order matters: nested frameworks/apps/bundles first, then loose libs, then the root
-        # Contents/MacOS main binary, then seal the bundle. Signing the main Client binary early
-        # (codesign treats it as an app bundle) then mutating nested content invalidates it —
-        # Apple notarize: "The signature of the binary is invalid."
+        # Sign Mach-O leaves once per inode (CEF hardlinks), deepest path first, no --deep.
+        # Then seal containers (.framework / .bundle / .app) deepest-first without --deep
+        # (nested leaves already signed). Finally seal root bundle if it has Info.plist.
         sign_bundle_tree() {
           local bundle="$1"
           echo "📂 Signing content inside: $bundle"
+          # bash 3.2 (macOS runners): no associative arrays — track inodes in a temp file
+          local inode_log
+          inode_log=$(mktemp /tmp/codesign-inodes.XXXXXX)
 
-          # 1) Frameworks (deepest first)
-          while IFS= read -r -d '' fw; do
-            echo "📘 Framework: $fw"
-            local fwname found c
-            fwname="$(basename "$fw" .framework)"
-            local candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
-            found=""
-            for c in "${candidates[@]}"; do
-              if [ -f "$c" ]; then
-                found="$c"
-                break
-              fi
-            done
-            if [ -z "$found" ]; then
-              found=$(find -L "$fw" -maxdepth 5 -type f -name "$fwname" -print -quit || true)
+          sign_leaf_once() {
+            local f="$1"
+            local inode
+            inode=$(stat -f '%i' "$f" 2>/dev/null || echo "")
+            if [ -n "$inode" ] && grep -qx "$inode" "$inode_log" 2>/dev/null; then
+              echo "⏭️  Skip hardlink (inode $inode already signed): $f"
+              return 0
             fi
-            if [ -z "$found" ]; then
-              found=$(find -L "$fw" -maxdepth 5 -type f -perm -111 -print -quit || true)
+            echo "🔧 Signing leaf: $f"
+            retry_codesign "$f" "--timestamp" "" || return 1
+            [ -n "$inode" ] && echo "$inode" >> "$inode_log"
+            return 0
+          }
+
+          # Depth-sorted paths (deepest first). Portable for bash 3.2 / BSD sort (no -z).
+          deepest_first() {
+            local root="$1"
+            shift
+            find -P "$root" "$@" -print | while IFS= read -r p; do
+              printf '%05d\t%s\n' "$(echo "$p" | tr -cd '/' | wc -c | tr -d ' ')" "$p"
+            done | sort -nr | cut -f2-
+          }
+
+          # 1) All Mach-O / dylib / so leaves, deepest first, unique inode
+          # Prefer -P (don't follow symlinks) so Versions/Current is not double-walked
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O|shared library|bundle|executable'; then
+              case "$f" in
+                *.dylib|*.so) ;;
+                *) continue ;;
+              esac
             fi
-            if [ -n "$found" ]; then
-              echo "🔧 Signing framework binary: $found"
-              retry_codesign "$found" "--timestamp" || return 1
-            else
-              echo "⚠️ Aucun binaire exécutable trouvé dans $fw (on signera quand même le .framework)"
-            fi
-            while IFS= read -r -d '' dylib; do
-              retry_codesign "$dylib" "--timestamp" || return 1
-            done < <(find -L "$fw" -type f -name "*.dylib" -print0)
-            retry_codesign "$fw" "--timestamp" || return 1
-          done < <(find -L "$bundle" -type d -name "*.framework" -print0)
+            sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
+          done < <(deepest_first "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \))
 
-          # 2) Bundles / plugins / kext (before internal .app seal where possible)
-          while IFS= read -r -d '' bp; do
-            echo "🔌 Plugin/bundle/kext: $bp"
-            local exe
-            exe=$(find -L "$bp" -maxdepth 6 -type f -perm -111 -print -quit || true)
-            if [ -n "$exe" ]; then
-              retry_codesign "$exe" "--timestamp" || return 1
-            fi
-            retry_codesign "$bp" "--timestamp" || return 1
-          done < <(find -L "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \) -print0)
+          # 2) Seal frameworks deepest-first (no --deep: leaves already signed)
+          while IFS= read -r fw; do
+            [ -n "$fw" ] || continue
+            echo "📘 Seal framework: $fw"
+            retry_codesign "$fw" "--timestamp" "" || { rm -f "$inode_log"; return 1; }
+          done < <(deepest_first "$bundle" -type d -name "*.framework")
 
-          # 3) Applications internes (.app) — nested content before main binary / seal
-          while IFS= read -r -d '' app; do
-            echo "📦 Internal .app: $app"
-            local mainexe exe
-            while IFS= read -r -d '' dylib; do
-              retry_codesign "$dylib" "--timestamp" || return 1
-            done < <(find -L "$app" -type f -name "*.dylib" -print0)
-            mainexe="$app/Contents/MacOS/$(basename "$app" .app)"
-            if [ -f "$mainexe" ]; then
-              retry_codesign "$mainexe" "--timestamp" || return 1
-            else
-              exe=$(find -L "$app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit 2>/dev/null || true)
-              if [ -z "$exe" ]; then
-                exe=$(find -L "$app" -maxdepth 6 -type f -perm -111 -print -quit || true)
-              fi
-              if [ -n "$exe" ]; then
-                retry_codesign "$exe" "--timestamp" || return 1
-              fi
-            fi
-            retry_codesign "$app" "--timestamp" || return 1
-          done < <(find -L "$bundle" -type d -name "*.app" -print0)
+          # 3) Seal bundles / plugins / kext deepest-first
+          while IFS= read -r bp; do
+            [ -n "$bp" ] || continue
+            echo "🔌 Seal bundle/plugin/kext: $bp"
+            retry_codesign "$bp" "--timestamp" "" || { rm -f "$inode_log"; return 1; }
+          done < <(deepest_first "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \))
 
-          # 4) Remaining loose libs / executables — skip nested package trees and root MacOS
-          #    (root MacOS is signed just before the final bundle seal).
-          while IFS= read -r -d '' f; do
-            echo "🔧 Signing file: $f"
-            retry_codesign "$f" "--timestamp" || return 1
-          done < <(
-            find -L "$bundle" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) \
-              ! -path "*.framework/*" ! -path "*.app/*" ! -path "*.bundle/*" \
-              ! -path "*.plugin/*" ! -path "*.kext/*" \
-              ! -path "$bundle/Contents/MacOS/*" \
-              -print0
-          )
+          # 4) Seal nested .app deepest-first
+          while IFS= read -r app; do
+            [ -n "$app" ] || continue
+            echo "📦 Seal nested .app: $app"
+            retry_codesign "$app" "--timestamp" "" || { rm -f "$inode_log"; return 1; }
+          done < <(deepest_first "$bundle" -type d -name "*.app")
 
-          # 5) Root Contents/MacOS main binaries (after all nested mutations)
-          if [ -d "$bundle/Contents/MacOS" ]; then
-            while IFS= read -r -d '' mainbin; do
-              echo "🔧 Signing root MacOS binary: $mainbin"
-              retry_codesign "$mainbin" "--timestamp" || return 1
-            done < <(find -L "$bundle/Contents/MacOS" -maxdepth 1 -type f -print0)
-          fi
+          rm -f "$inode_log"
 
-          # 6) Bundle root with Contents/Info.plist (4D 20R8+ / client .4darchive layout)
+          # 5) Seal root if it is an app-like bundle (client .4darchive layout)
           if [ -f "$bundle/Contents/Info.plist" ]; then
             echo "📦 Signature finale du package: $bundle"
-            retry_codesign "$bundle" "--timestamp" || return 1
-            if ! codesign --verify --verbose --deep --strict "$bundle" 2>&1; then
+            retry_codesign "$bundle" "--timestamp" "" || return 1
+            if ! codesign --verify --verbose --strict "$bundle" 2>&1; then
               echo "❌ codesign --verify échoué après signature finale: $bundle"
               return 1
             fi
           fi
         }
 
-        # Expand ZIP .4darchive → sign tree → recompress in place (keeps file format for 4D auto-update)
+        # Expand ZIP .4darchive → sign tree → recompress in place (preserve symlinks, no AppleDouble)
         prepare_and_sign_zip_4darchive() {
           local archive="$1"
           local work extract_root out_tmp
@@ -327,13 +307,28 @@ runs:
             fi
           fi
           sign_bundle_tree "$sign_root" || { rm -rf "$work"; return 1; }
+
+          # Fail fast before ZIP if seals are already broken
+          if [ -f "$sign_root/Contents/Info.plist" ]; then
+            if ! codesign --verify --verbose --strict "$sign_root" 2>&1; then
+              echo "❌ Signature invalide AVANT recompress ZIP: $sign_root"
+              rm -rf "$work"
+              return 1
+            fi
+            echo "✅ Verify OK before ZIP recompress"
+          fi
+
           out_tmp="${archive}.signed.tmp.zip"
           rm -f "$out_tmp"
-          # Archive contents of extract_root (preserve original zip layout)
-          if ! ditto -c -k --sequesterRsrc "$extract_root" "$out_tmp" 2>/dev/null; then
-            echo "⚠️ ditto -c -k a échoué, fallback zip"
-            (cd "$extract_root" && zip -r -y -q "$out_tmp" .)
-          fi
+          # -y: store symlinks as symlinks (critical for .framework/Versions/Current)
+          # -X: no extra file attributes that can disturb seals
+          # Avoid ditto --sequesterRsrc (AppleDouble ._ files break notarization)
+          echo "📦 Recompress ZIP (zip -ryX) from $extract_root"
+          (cd "$extract_root" && zip -r -y -X -q "$out_tmp" .) || {
+            echo "❌ zip recompress failed"
+            rm -rf "$work"
+            return 1
+          }
           mv -f "$out_tmp" "$archive"
           xattr -cr "$archive" 2>/dev/null || true
           rm -rf "$work"
@@ -411,7 +406,7 @@ runs:
               for exe in "$item/Contents/MacOS/"*; do
                 if [ -f "$exe" ]; then
                   echo "🔧 Signing internal executable: $exe"
-                  retry_codesign "$exe" "--timestamp" || exit 1
+                  retry_codesign "$exe" "--timestamp" "" || exit 1
                 fi
               done
             fi
@@ -423,18 +418,22 @@ runs:
                 echo "  ↳ Sous-app détectée : $subapp"
                 mainexe="$subapp/Contents/MacOS/$(basename "$subapp" .app)"
                 if [ -f "$mainexe" ]; then
-                  retry_codesign "$mainexe" "--timestamp" || exit 1
+                  retry_codesign "$mainexe" "--timestamp" "" || exit 1
                 else
                   exe=$(find "$subapp" -type f -perm -111 -maxdepth 6 -print -quit || true)
                   if [ -n "$exe" ]; then
-                    retry_codesign "$exe" "--timestamp" || exit 1
+                    retry_codesign "$exe" "--timestamp" "" || exit 1
                   fi
                 fi
-                retry_codesign "$subapp" "--timestamp" || exit 1
+                retry_codesign "$subapp" "--timestamp" "--deep" || exit 1
               done < <(find "$item/Contents/MacOS" -type d -name "*.app" -print0)
             fi
 
-            retry_codesign "$item" "--timestamp" || exit 1
+            deep_flag=""
+            case "$item" in
+              *.app|*.framework|*.bundle|*.plugin|*.kext) deep_flag="--deep" ;;
+            esac
+            retry_codesign "$item" "--timestamp" "$deep_flag" || exit 1
           done < <(
             find "${product_path}" \
               \( -type f -perm -111 -o -name "*.dylib" -o -name "*.so" \
@@ -535,7 +534,7 @@ runs:
 
             if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
               echo "⚠️ Re-signature requise: $dylib"
-              retry_codesign "$dylib" "--timestamp" || exit 1
+              retry_codesign "$dylib" "--timestamp" "" || exit 1
 
               sig_info=$(codesign -dv --verbose=4 "$dylib" 2>&1 || true)
               if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
@@ -588,7 +587,7 @@ runs:
 
             if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
               echo "⚠️ Re-signature framework main binary requise: $main_bin"
-              retry_codesign "$main_bin" "--timestamp" || exit 1
+              retry_codesign "$main_bin" "--timestamp" "" || exit 1
 
               sig_info=$(codesign -dv --verbose=4 "$main_bin" 2>&1 || true)
               if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
@@ -609,7 +608,7 @@ runs:
         # product_path already trimmed at script start.
         if [[ "${product_path}" == *.app ]]; then
           echo "📦 Signature finale de l’app principale : ${product_path}"
-          retry_codesign "${product_path}" "--timestamp" || exit 1
+          retry_codesign "${product_path}" "--timestamp" "--deep" || exit 1
         elif [[ -d "${product_path}" && ( "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ) ]]; then
           # Depuis 4D 20R8, un composant utilisant la structure "Contents/Info.plist" doit être
           # signé en tant que bundle racine, faute de quoi macOS ne génère jamais
@@ -617,7 +616,7 @@ runs:
           # (plates, sans Contents/Info.plist) ne sont pas concernées et restent inchangées.
           if [ -f "${product_path}/Contents/Info.plist" ]; then
             echo "📦 Structure Contents/Info.plist détectée — signature finale du bundle : ${product_path}"
-            retry_codesign "${product_path}" "--timestamp" || exit 1
+            retry_codesign "${product_path}" "--timestamp" "--deep" || exit 1
           else
             echo "ℹ️ ${product_path} : structure historique (plate, sans Contents/Info.plist) — pas de signature de bundle racine."
           fi
