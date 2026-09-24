@@ -337,60 +337,125 @@ runs:
           printf '%s' "$sign_root"
         }
 
-        # For ZIP .4darchive: only materialize helper *executables* if they are symlinks.
-        # Do NOT copy Chromium Embedded Framework into each helper — that bloats the archive
-        # from ~300MB to ~1GB and pushes Server DMG over GitHub's 2GB release limit.
-        # CEF relative symlinks are fine inside the nested ZIP (validated by pre-fix builds).
-        normalize_helper_exec_symlinks_under() {
+        # For ZIP .4darchive: keep slim size (no CEF ditto copies).
+        # Build-time archives often have broken CEF symlinks inside 4D Helper*.app
+        # ("invalid destination for symbolic link"). Retarget them to the shared CEF
+        # next to the helpers: ../../../Chromium Embedded Framework.framework
+        # Also materialize helper *executable* symlinks (Apple rejects those).
+        normalize_helpers_slim_under() {
           local root="$1"
           local py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
-          local fixed=0
-          while IFS= read -r -d '' APP; do
-            local NAME EXE TGT RESOLVED
-            NAME="$(basename "$APP" .app)"
-            EXE="$APP/Contents/MacOS/$NAME"
-            if [ -L "$EXE" ]; then
-              TGT="$(readlink "$EXE")"
-              RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
-              if [ -f "$RESOLVED" ]; then
-                echo "🪄 Remplace symlink exécutable helper: $EXE"
-                rm -f "$EXE"
-                /usr/bin/ditto "$RESOLVED" "$EXE"
-                chmod 755 "$EXE"
-                fixed=$((fixed + 1))
-              else
-                echo "⚠️ Cible symlink introuvable (laissé tel quel): $EXE -> $TGT"
-              fi
+          local cef_rel="../../../Chromium Embedded Framework.framework"
+          local exec_fixed=0
+          local cef_fixed=0
+
+          while IFS= read -r -d '' BUNDLE_FW; do
+            local SRC_CEF="${BUNDLE_FW}/Chromium Embedded Framework.framework"
+            if [ ! -d "$SRC_CEF" ] && [ ! -L "$SRC_CEF" ]; then
+              echo "⚠️ CEF partagé introuvable dans $BUNDLE_FW — skip helpers ici"
+              continue
             fi
-          done < <(find "$root" -type d -name "4D Helper*.app" -print0)
-          echo "ℹ️ Helper exec symlinks materialisés: $fixed (CEF frameworks laissés en symlink)"
+            echo "📦 Slim-normalize helpers under: $BUNDLE_FW"
+
+            while IFS= read -r -d '' APP; do
+              local NAME EXE TGT RESOLVED DEST_CEF
+              NAME="$(basename "$APP" .app)"
+              EXE="$APP/Contents/MacOS/$NAME"
+              if [ -L "$EXE" ]; then
+                TGT="$(readlink "$EXE")"
+                RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
+                if [ -f "$RESOLVED" ]; then
+                  echo "🪄 Materialize helper exec: $EXE"
+                  rm -f "$EXE"
+                  /usr/bin/ditto "$RESOLVED" "$EXE"
+                  chmod 755 "$EXE"
+                  exec_fixed=$((exec_fixed + 1))
+                else
+                  echo "⚠️ Helper exec symlink broken: $EXE -> $TGT"
+                fi
+              fi
+
+              DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+              mkdir -p "$APP/Contents/Frameworks"
+              # Always prefer a valid relative symlink (never a full copy)
+              if [ -L "$DEST_CEF" ] || [ -e "$DEST_CEF" ]; then
+                # Resolve current target; rewrite if missing/invalid
+                if [ -L "$DEST_CEF" ]; then
+                  if [ ! -e "$DEST_CEF" ]; then
+                    echo "🪄 CEF symlink cassé → $cef_rel dans $APP"
+                    rm -f "$DEST_CEF"
+                    ln -s "$cef_rel" "$DEST_CEF"
+                    cef_fixed=$((cef_fixed + 1))
+                  elif [ "$(readlink "$DEST_CEF")" != "$cef_rel" ]; then
+                    # Exists but non-canonical — keep if resolvable, else rewrite
+                    if [ ! -d "$DEST_CEF" ]; then
+                      echo "🪄 CEF symlink retarget → $cef_rel dans $APP"
+                      rm -f "$DEST_CEF"
+                      ln -s "$cef_rel" "$DEST_CEF"
+                      cef_fixed=$((cef_fixed + 1))
+                    fi
+                  fi
+                elif [ -d "$DEST_CEF" ]; then
+                  # Real directory copy (fat) — replace with symlink to stay slim
+                  echo "🪄 CEF copy → symlink $cef_rel dans $APP (slim)"
+                  rm -rf "$DEST_CEF"
+                  ln -s "$cef_rel" "$DEST_CEF"
+                  cef_fixed=$((cef_fixed + 1))
+                fi
+              else
+                echo "🪄 CEF absent → symlink $cef_rel dans $APP"
+                ln -s "$cef_rel" "$DEST_CEF"
+                cef_fixed=$((cef_fixed + 1))
+              fi
+
+              # Confirm relative link resolves
+              if [ ! -d "$DEST_CEF" ]; then
+                echo "❌ CEF symlink toujours invalide dans $APP (cible $cef_rel)"
+                ls -la "$APP/Contents/Frameworks" || true
+                return 1
+              fi
+            done < <(find "$BUNDLE_FW" -type d -name "4D Helper*.app" -print0)
+          done < <(find "$root" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
+
+          echo "ℹ️ Slim helpers: exec_fixed=$exec_fixed cef_symlinks_fixed=$cef_fixed"
+          return 0
         }
 
+        # Strict validity: root (or main) AND every 4D Helper*.app must codesign --verify.
+        # Soft-passing on main alone skipped broken CEF helper symlinks (preflight then failed).
         archive_tree_verifies() {
           local sign_root="$1"
-          local main=""
+          local main="" helper
+
           if [ -f "$sign_root/Contents/Info.plist" ]; then
-            if codesign --verify --strict "$sign_root" >/dev/null 2>&1; then
-              return 0
+            if ! codesign --verify --strict "$sign_root" >/dev/null 2>&1; then
+              main=$(find -P "$sign_root/Contents/MacOS" -maxdepth 1 -type f -print -quit 2>/dev/null)
+              if [ -z "$main" ] || ! codesign --verify --strict "$main" >/dev/null 2>&1; then
+                return 1
+              fi
             fi
-            main=$(find -P "$sign_root/Contents/MacOS" -maxdepth 1 -type f -print -quit 2>/dev/null)
-            if [ -n "$main" ] && codesign --verify --strict "$main" >/dev/null 2>&1; then
-              echo "ℹ️ Bundle root verify soft-fail; main binary OK: $main"
-              return 0
+          elif [ -f "$sign_root/Info.plist" ] && [ -d "$sign_root/MacOS" ]; then
+            main=$(find -P "$sign_root/MacOS" -maxdepth 1 -type f -print -quit 2>/dev/null)
+            if [ -z "$main" ] || ! codesign --verify --strict "$main" >/dev/null 2>&1; then
+              return 1
             fi
+          else
             return 1
           fi
-          if [ -f "$sign_root/Info.plist" ] && [ -d "$sign_root/MacOS" ]; then
-            main=$(find -P "$sign_root/MacOS" -maxdepth 1 -type f -print -quit 2>/dev/null)
-            if [ -n "$main" ] && codesign --verify --strict "$main" >/dev/null 2>&1; then
-              return 0
+
+          while IFS= read -r helper; do
+            [ -n "$helper" ] || continue
+            if ! codesign --verify --strict "$helper" >/dev/null 2>&1; then
+              echo "ℹ️ Helper verify fail: $helper"
+              return 1
             fi
-          fi
-          return 1
+          done < <(find "$sign_root" -type d -name "4D Helper*.app" -print)
+
+          return 0
         }
 
         # Expand ZIP .4darchive → sign only if needed → recompress (zip -ryX, no AppleDouble)
-        # Keeps slim layout (CEF symlinks). Client.app CEF copies stay on the .app codesign path only.
+        # Keeps slim layout (CEF relative symlinks). Client.app CEF copies stay on .app path only.
         prepare_and_sign_zip_4darchive() {
           local archive="$1"
           local work extract_root out_tmp sign_root
@@ -406,24 +471,27 @@ runs:
           sign_root="$(resolve_sign_root "$extract_root")"
           echo "📂 sign_root=$sign_root"
 
-          # If already valid, keep as-is (no recompress → preserves original slim ZIP)
           if archive_tree_verifies "$sign_root"; then
-            echo "✅ Archive déjà valide — pas de re-signature ni recompress"
+            echo "✅ Archive déjà valide (root + helpers) — pas de re-signature ni recompress"
             rm -rf "$work"
             return 0
           fi
-          echo "ℹ️ Archive non valide telle quelle — fix helper exec symlinks + sign + recompress (sans copies CEF)"
+          echo "ℹ️ Archive non valide — fix helper exec + CEF symlinks relatifs + sign + recompress (sans copies CEF)"
 
-          normalize_helper_exec_symlinks_under "$sign_root"
+          normalize_helpers_slim_under "$sign_root" || { rm -rf "$work"; return 1; }
           sign_bundle_tree "$sign_root" || { rm -rf "$work"; return 1; }
 
           if ! archive_tree_verifies "$sign_root"; then
             echo "❌ Signature invalide AVANT recompress ZIP: $sign_root"
             codesign --verify --verbose --strict "$sign_root" 2>&1 || true
+            while IFS= read -r helper; do
+              [ -n "$helper" ] || continue
+              codesign --verify --verbose --strict "$helper" 2>&1 || true
+            done < <(find "$sign_root" -type d -name "4D Helper*.app" -print)
             rm -rf "$work"
             return 1
           fi
-          echo "✅ Verify OK before ZIP recompress"
+          echo "✅ Verify OK before ZIP recompress (root + helpers)"
 
           out_tmp="${archive}.signed.tmp.zip"
           rm -f "$out_tmp"
