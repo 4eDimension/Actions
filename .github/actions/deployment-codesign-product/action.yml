@@ -337,41 +337,33 @@ runs:
           printf '%s' "$sign_root"
         }
 
-        normalize_cef_helpers_under() {
+        # For ZIP .4darchive: only materialize helper *executables* if they are symlinks.
+        # Do NOT copy Chromium Embedded Framework into each helper — that bloats the archive
+        # from ~300MB to ~1GB and pushes Server DMG over GitHub's 2GB release limit.
+        # CEF relative symlinks are fine inside the nested ZIP (validated by pre-fix builds).
+        normalize_helper_exec_symlinks_under() {
           local root="$1"
           local py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
-          while IFS= read -r -d '' BUNDLE_ROOT; do
-            echo "📦 CEF normalize under archive: $BUNDLE_ROOT"
-            local SRC_CEF="${BUNDLE_ROOT}/Chromium Embedded Framework.framework"
-            if [ ! -d "$SRC_CEF" ]; then
-              echo "⚠️ CEF introuvable dans $BUNDLE_ROOT — skip"
-              continue
+          local fixed=0
+          while IFS= read -r -d '' APP; do
+            local NAME EXE TGT RESOLVED
+            NAME="$(basename "$APP" .app)"
+            EXE="$APP/Contents/MacOS/$NAME"
+            if [ -L "$EXE" ]; then
+              TGT="$(readlink "$EXE")"
+              RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
+              if [ -f "$RESOLVED" ]; then
+                echo "🪄 Remplace symlink exécutable helper: $EXE"
+                rm -f "$EXE"
+                /usr/bin/ditto "$RESOLVED" "$EXE"
+                chmod 755 "$EXE"
+                fixed=$((fixed + 1))
+              else
+                echo "⚠️ Cible symlink introuvable (laissé tel quel): $EXE -> $TGT"
+              fi
             fi
-            while IFS= read -r -d '' APP; do
-              local NAME EXE TGT RESOLVED DEST_CEF
-              NAME="$(basename "$APP" .app)"
-              EXE="$APP/Contents/MacOS/$NAME"
-              if [ -L "$EXE" ]; then
-                TGT="$(readlink "$EXE")"
-                RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
-                if [ -f "$RESOLVED" ]; then
-                  echo "🪄 Remplace symlink exécutable: $EXE"
-                  rm -f "$EXE"
-                  /usr/bin/ditto "$RESOLVED" "$EXE"
-                  chmod 755 "$EXE"
-                fi
-              fi
-              DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
-              if [ -L "$DEST_CEF" ]; then
-                echo "🪄 Supprime symlink CEF dans $APP"
-                rm -f "$DEST_CEF"
-              fi
-              if [ ! -d "$DEST_CEF" ]; then
-                echo "📚 Copie CEF local dans: $DEST_CEF"
-                /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
-              fi
-            done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
-          done < <(find "$root" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
+          done < <(find "$root" -type d -name "4D Helper*.app" -print0)
+          echo "ℹ️ Helper exec symlinks materialisés: $fixed (CEF frameworks laissés en symlink)"
         }
 
         archive_tree_verifies() {
@@ -383,8 +375,6 @@ runs:
             fi
             main=$(find -P "$sign_root/Contents/MacOS" -maxdepth 1 -type f -print -quit 2>/dev/null)
             if [ -n "$main" ] && codesign --verify --strict "$main" >/dev/null 2>&1; then
-              # Outer pseudo-bundle seal may be absent when archive was packed from .app Contents/
-              # but leaf signatures from the notarized app are what Apple checks inside the ZIP.
               echo "ℹ️ Bundle root verify soft-fail; main binary OK: $main"
               return 0
             fi
@@ -400,6 +390,7 @@ runs:
         }
 
         # Expand ZIP .4darchive → sign only if needed → recompress (zip -ryX, no AppleDouble)
+        # Keeps slim layout (CEF symlinks). Client.app CEF copies stay on the .app codesign path only.
         prepare_and_sign_zip_4darchive() {
           local archive="$1"
           local work extract_root out_tmp sign_root
@@ -415,15 +406,15 @@ runs:
           sign_root="$(resolve_sign_root "$extract_root")"
           echo "📂 sign_root=$sign_root"
 
-          # If already valid (e.g. archive rebuilt from notarized Client.app), keep as-is
+          # If already valid, keep as-is (no recompress → preserves original slim ZIP)
           if archive_tree_verifies "$sign_root"; then
             echo "✅ Archive déjà valide — pas de re-signature ni recompress"
             rm -rf "$work"
             return 0
           fi
-          echo "ℹ️ Archive non valide telle quelle — normalize CEF + sign + recompress"
+          echo "ℹ️ Archive non valide telle quelle — fix helper exec symlinks + sign + recompress (sans copies CEF)"
 
-          normalize_cef_helpers_under "$sign_root"
+          normalize_helper_exec_symlinks_under "$sign_root"
           sign_bundle_tree "$sign_root" || { rm -rf "$work"; return 1; }
 
           if ! archive_tree_verifies "$sign_root"; then
