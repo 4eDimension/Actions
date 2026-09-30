@@ -278,12 +278,27 @@ runs:
           }
 
           # 1) Mach-O leaves, deepest first, unique inode.
-          # Skip root Contents/MacOS/* when this tree is app-like: those binaries are sealed
-          # with the final package signature. Signing them early as "app bundle" then mutating
-          # nested helpers invalidates the seal.
-          local leaf_find=( -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) )
+          # Skip ONLY direct MacOS executables of THIS package (sealed at step 5).
+          # Do NOT skip Contents/MacOS/*.app/** — InstallTool.app + LaunchServices
+          # helpers (com.4D.Helper) live there and notarization requires them signed
+          # (hardened runtime + timestamp). LaunchServices often lack +x.
+          local leaf_find=(
+            -type f \(
+              -perm -111 -o -name "*.dylib" -o -name "*.so"
+              -o -path "*/Library/LaunchServices/*"
+              -o -path "*/XPCServices/*"
+              -o -name "*.xpc"
+            \)
+          )
           if [ -f "$bundle/Contents/Info.plist" ] || [ -f "$bundle/Info.plist" ]; then
-            leaf_find+=( ! -path "$bundle/Contents/MacOS/*" ! -path "$bundle/MacOS/*" )
+            leaf_find+=(
+              ! \( -path "$bundle/Contents/MacOS/*"
+                   ! -path "$bundle/Contents/MacOS/*.app"
+                   ! -path "$bundle/Contents/MacOS/*.app/*" \)
+              ! \( -path "$bundle/MacOS/*"
+                   ! -path "$bundle/MacOS/*.app"
+                   ! -path "$bundle/MacOS/*.app/*" \)
+            )
           fi
           while IFS= read -r f; do
             [ -n "$f" ] || continue
@@ -295,6 +310,14 @@ runs:
             fi
             sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" "${leaf_find[@]}")
+
+          # 1b) Explicit pass: any Mach-O under LaunchServices / XPCServices we might
+          # have missed (odd permissions / names). Notarization rejects unsigned ones.
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            file -b "$f" 2>/dev/null | grep -qiE 'Mach-O' || continue
+            sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
+          done < <(deepest_first "$bundle" -type f \( -path "*/Library/LaunchServices/*" -o -path "*/XPCServices/*" \))
 
           # 2) Seal frameworks deepest-first (no --deep: leaves already signed)
           while IFS= read -r fw; do
