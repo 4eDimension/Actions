@@ -23,28 +23,45 @@ runs:
 
     - name: setup keychain
       id: setup
-      run: |        
+      run: |
+        set -euo pipefail
         CERTIFICATE_PATH="${RUNNER_TEMP}/Developer ID Application.p12"
-        echo "CERTIFICATE_PATH=${CERTIFICATE_PATH}" >> $GITHUB_OUTPUT 
+        echo "CERTIFICATE_PATH=${CERTIFICATE_PATH}" >> $GITHUB_OUTPUT
         KEYCHAIN_PATH="${RUNNER_TEMP}/temp.keychain-db"
         echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> $GITHUB_OUTPUT
+
         echo -n "${APPLE_DEVELOPER_ID_CERTIFICATE}" | base64 --decode > "${CERTIFICATE_PATH}"
+
+        # Fresh temp keychain per job (avoid leftover lock / ACL state on self-hosted runners)
+        rm -f "${KEYCHAIN_PATH}" "${KEYCHAIN_PATH}-db" 2>/dev/null || true
         security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
-        security set-keychain-settings -t 21600 "${KEYCHAIN_PATH}"
+
+        # Do NOT enable lock-on-sleep (-l) or lock-after-timeout (-u): both cause
+        # intermittent errSecInternalComponent during long codesign loops.
+        security set-keychain-settings "${KEYCHAIN_PATH}"
         security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
-        security import "${CERTIFICATE_PATH}" -P "${APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD}" -t cert -f pkcs12 -k "${KEYCHAIN_PATH}" -T /usr/bin/codesign
+
+        # Prefer our keychain first in the user search list (keep existing ones).
+        EXISTING=$(security list-keychains -d user | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | tr '\n' ' ')
+        security list-keychains -d user -s "${KEYCHAIN_PATH}" ${EXISTING}
+
+        security default-keychain -s "${KEYCHAIN_PATH}"
+
+        security import "${CERTIFICATE_PATH}" \
+          -P "${APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD}" \
+          -t cert -f pkcs12 \
+          -k "${KEYCHAIN_PATH}" \
+          -T /usr/bin/codesign \
+          -T /usr/bin/security \
+          -T /usr/bin/productsign
+
+        # Allow codesign without GUI unlock prompts (critical on headless runners)
         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+        security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        echo "✅ Keychain ready: ${KEYCHAIN_PATH}"
       env:
         APPLE_DEVELOPER_ID_CERTIFICATE: ${{ inputs.APPLE_DEVELOPER_ID_CERTIFICATE }}
         APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ inputs.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
         KEYCHAIN_PASSWORD: ${{ inputs.KEYCHAIN_PASSWORD }}
-      shell: bash 
-      
-    - name: set default
-      id: default      
-      if: ${{ contains(runner.name, 'Github Actions') }}
-      run: |  
-        security default-keychain -s "${KEYCHAIN_PATH}"
-      env:
-        KEYCHAIN_PATH: ${{ steps.setup.outputs.KEYCHAIN_PATH }}
       shell: bash 
