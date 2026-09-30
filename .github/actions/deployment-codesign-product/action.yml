@@ -170,6 +170,7 @@ runs:
           local attempt=1
           local max_attempts=5
           local delay=5
+          local sub
           while [ $attempt -le $max_attempts ]; do
             echo "[$attempt/$max_attempts] codesign ${deep_flag:-} de: $target"
             # shellcheck disable=SC2086
@@ -182,9 +183,23 @@ runs:
               echo "✅ codesign réussi pour $target"
               return 0
             fi
-            if echo "$output" | grep -qiE "no identity found|password|resource fork|invalid|not found in keychain|code object is not signed at all"; then
+            # Unsigned nested code is an ordering problem, not a hard identity failure.
+            # Sign the reported subcomponent (e.g. Chromium Embedded Framework) then retry.
+            if echo "$output" | grep -qi "In subcomponent:"; then
+              sub=$(echo "$output" | sed -n 's/.*In subcomponent:[[:space:]]*//p' | head -1 | tr -d '\r')
+              if [ -n "$sub" ] && [ -e "$sub" ] && [ "$sub" != "$target" ]; then
+                echo "↪️ Unsigned subcomponent — sign first: $sub"
+                # Recurse without deep; ignore failure so outer retry still runs
+                retry_codesign "$sub" "$timestamp_flag" "" || true
+                attempt=$(( attempt + 1 ))
+                continue
+              fi
+            fi
+            if echo "$output" | grep -qiE "no identity found|password|resource fork|invalid|not found in keychain"; then
               # errSecInternalComponent is transient — do not treat as fatal
-              if ! echo "$output" | grep -qiE "errSecInternalComponent|CSSMERR_CSP_DISABLED"; then
+              # "code object is not signed at all" alone is also NOT fatal when we can retry
+              # after signing nested content (handled above via In subcomponent).
+              if ! echo "$output" | grep -qiE "errSecInternalComponent|CSSMERR_CSP_DISABLED|code object is not signed at all"; then
                 echo "❌ Erreur fatale détectée, arrêt immédiat."
                 return 1
               fi
@@ -222,11 +237,18 @@ runs:
         }
 
         # Depth-sorted paths (deepest first). Portable for bash 3.2 / BSD sort (no -z).
-        # find prints parents before children; codesign requires nested .app signed first.
+        # find prints parents before children; codesign requires nested code signed first.
+        # Nested .4dbase/.4darchive interiors are left to étape 2 (skip when not the root).
         deepest_first() {
           local root="$1"
           shift
           find -P "$root" "$@" -print | while IFS= read -r p; do
+            rel="${p#"$root"/}"
+            if [ "$rel" != "$p" ]; then
+              case "$rel" in
+                *.4dbase/*|*.4darchive/*) continue ;;
+              esac
+            fi
             printf '%05d\t%s\n' "$(echo "$p" | tr -cd '/' | wc -c | tr -d ' ')" "$p"
           done | sort -nr | cut -f2-
         }
@@ -642,65 +664,15 @@ runs:
           fi
         }
 
-        # === Étape 1 : signer tous les binaires, frameworks, bundles, plugins, kexts et apps sauf .4dbase/.4darchive ===
-        # Skip when product_path is itself a ZIP file (Archive Client path)
+        # === Étape 1 : inside-out sign of .app / directory products ===
+        # Skip when product_path is itself a ZIP file (Archive Client path).
+        # Do NOT use a raw find loop: find lists parents before children, so we used to
+        # codesign 4D Helper MacOS while Chromium Embedded Framework was still unsigned
+        # (Normalize copies CEF into helpers), then abort on "code object is not signed".
+        # sign_bundle_tree already does leaves → frameworks → bundles → apps deepest-first.
         if [ -d "${product_path}" ]; then
-          echo "=== Signing all main components ==="
-          # Sign nested Helper/CEF .apps under a container (Frameworks/, etc.) before
-          # Contents/MacOS or sealing the parent. find lists parents before children,
-          # which made WebViewerCEF.bundle fail with unsigned 4D Helper*.app.
-          sign_nested_apps_under() {
-            local container="$1"
-            local subapp mainexe exe
-            while IFS= read -r subapp; do
-              [ -n "$subapp" ] || continue
-              echo "  ↳ Nested app (pre-seal): $subapp"
-              mainexe="$subapp/Contents/MacOS/$(basename "$subapp" .app)"
-              if [ -f "$mainexe" ]; then
-                retry_codesign "$mainexe" "--timestamp" "" || return 1
-              else
-                exe=$(find "$subapp/Contents/MacOS" -type f -perm -111 -maxdepth 1 -print -quit 2>/dev/null || true)
-                if [ -n "$exe" ]; then
-                  retry_codesign "$exe" "--timestamp" "" || return 1
-                fi
-              fi
-              while IFS= read -r fw; do
-                [ -n "$fw" ] || continue
-                echo "    ↳ Nested framework: $fw"
-                retry_codesign "$fw" "--timestamp" "" || return 1
-              done < <(deepest_first "$subapp" -type d -name "*.framework")
-              retry_codesign "$subapp" "--timestamp" "--deep" || return 1
-            done < <(deepest_first "$container" -mindepth 1 -type d -name "*.app")
-          }
-
-          while IFS= read -r -d '' item; do
-            # ⚡ Nested CEF helpers (Frameworks) before any MacOS / --deep seal
-            if [[ "$item" == *.bundle ]] || [[ "$item" == *.app ]]; then
-              echo "📦 Container: $item"
-              sign_nested_apps_under "$item" || exit 1
-            fi
-
-            # ⚡ Fix notarisation : signer les binaires internes des bundles avant le bundle lui-même
-            if [[ "$item" == *.bundle ]]; then
-              for exe in "$item/Contents/MacOS/"*; do
-                if [ -f "$exe" ]; then
-                  echo "🔧 Signing internal executable: $exe"
-                  retry_codesign "$exe" "--timestamp" "" || exit 1
-                fi
-              done
-            fi
-
-            deep_flag=""
-            case "$item" in
-              *.app|*.framework|*.bundle|*.plugin|*.kext) deep_flag="--deep" ;;
-            esac
-            retry_codesign "$item" "--timestamp" "$deep_flag" || exit 1
-          done < <(
-            find "${product_path}" \
-              \( -type f -perm -111 -o -name "*.dylib" -o -name "*.so" \
-                -o -type d -name "*.framework" -o -type d -name "*.bundle" -o -type d -name "*.plugin" -o -type d -name "*.kext" -o -type d -name "*.app" \) \
-              ! -path "*.4dbase/*" ! -path "*.4darchive/*" -print0
-          )
+          echo "=== Signing all main components (sign_bundle_tree) ==="
+          sign_bundle_tree "${product_path}" || exit 1
         else
           echo "=== Skipping étape 1 (product_path is not a directory): ${product_path} ==="
         fi
