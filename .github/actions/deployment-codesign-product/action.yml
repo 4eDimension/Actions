@@ -221,6 +221,16 @@ runs:
           return 0
         }
 
+        # Depth-sorted paths (deepest first). Portable for bash 3.2 / BSD sort (no -z).
+        # find prints parents before children; codesign requires nested .app signed first.
+        deepest_first() {
+          local root="$1"
+          shift
+          find -P "$root" "$@" -print | while IFS= read -r p; do
+            printf '%05d\t%s\n' "$(echo "$p" | tr -cd '/' | wc -c | tr -d ' ')" "$p"
+          done | sort -nr | cut -f2-
+        }
+
         # Sign Mach-O leaves once per inode (CEF hardlinks), deepest path first, no --deep.
         # Then seal containers (.framework / .bundle / .app) deepest-first without --deep
         # (nested leaves already signed). Finally seal root bundle if it has Info.plist.
@@ -243,15 +253,6 @@ runs:
             retry_codesign "$f" "--timestamp" "" || return 1
             [ -n "$inode" ] && echo "$inode" >> "$inode_log"
             return 0
-          }
-
-          # Depth-sorted paths (deepest first). Portable for bash 3.2 / BSD sort (no -z).
-          deepest_first() {
-            local root="$1"
-            shift
-            find -P "$root" "$@" -print | while IFS= read -r p; do
-              printf '%05d\t%s\n' "$(echo "$p" | tr -cd '/' | wc -c | tr -d ' ')" "$p"
-            done | sort -nr | cut -f2-
           }
 
           # 1) Mach-O leaves, deepest first, unique inode.
@@ -645,7 +646,40 @@ runs:
         # Skip when product_path is itself a ZIP file (Archive Client path)
         if [ -d "${product_path}" ]; then
           echo "=== Signing all main components ==="
+          # Sign nested Helper/CEF .apps under a container (Frameworks/, etc.) before
+          # Contents/MacOS or sealing the parent. find lists parents before children,
+          # which made WebViewerCEF.bundle fail with unsigned 4D Helper*.app.
+          sign_nested_apps_under() {
+            local container="$1"
+            local subapp mainexe exe
+            while IFS= read -r subapp; do
+              [ -n "$subapp" ] || continue
+              echo "  ↳ Nested app (pre-seal): $subapp"
+              mainexe="$subapp/Contents/MacOS/$(basename "$subapp" .app)"
+              if [ -f "$mainexe" ]; then
+                retry_codesign "$mainexe" "--timestamp" "" || return 1
+              else
+                exe=$(find "$subapp/Contents/MacOS" -type f -perm -111 -maxdepth 1 -print -quit 2>/dev/null || true)
+                if [ -n "$exe" ]; then
+                  retry_codesign "$exe" "--timestamp" "" || return 1
+                fi
+              fi
+              while IFS= read -r fw; do
+                [ -n "$fw" ] || continue
+                echo "    ↳ Nested framework: $fw"
+                retry_codesign "$fw" "--timestamp" "" || return 1
+              done < <(deepest_first "$subapp" -type d -name "*.framework")
+              retry_codesign "$subapp" "--timestamp" "--deep" || return 1
+            done < <(deepest_first "$container" -mindepth 1 -type d -name "*.app")
+          }
+
           while IFS= read -r -d '' item; do
+            # ⚡ Nested CEF helpers (Frameworks) before any MacOS / --deep seal
+            if [[ "$item" == *.bundle ]] || [[ "$item" == *.app ]]; then
+              echo "📦 Container: $item"
+              sign_nested_apps_under "$item" || exit 1
+            fi
+
             # ⚡ Fix notarisation : signer les binaires internes des bundles avant le bundle lui-même
             if [[ "$item" == *.bundle ]]; then
               for exe in "$item/Contents/MacOS/"*; do
@@ -654,24 +688,6 @@ runs:
                   retry_codesign "$exe" "--timestamp" "" || exit 1
                 fi
               done
-            fi
-
-            # ⚡ Fix sous-apps internes avant de signer une app
-            if [[ "$item" == *.app ]]; then
-              echo "📦 Application détectée : $item"
-              while IFS= read -r -d '' subapp; do
-                echo "  ↳ Sous-app détectée : $subapp"
-                mainexe="$subapp/Contents/MacOS/$(basename "$subapp" .app)"
-                if [ -f "$mainexe" ]; then
-                  retry_codesign "$mainexe" "--timestamp" "" || exit 1
-                else
-                  exe=$(find "$subapp" -type f -perm -111 -maxdepth 6 -print -quit || true)
-                  if [ -n "$exe" ]; then
-                    retry_codesign "$exe" "--timestamp" "" || exit 1
-                  fi
-                fi
-                retry_codesign "$subapp" "--timestamp" "--deep" || exit 1
-              done < <(find "$item/Contents/MacOS" -type d -name "*.app" -print0)
             fi
 
             deep_flag=""
