@@ -161,6 +161,13 @@ runs:
           echo "🔄 Refresh keychain access: ${keychain}"
           security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain}" || true
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${keychain}" >/dev/null 2>&1 || true
+          security default-keychain -s "${keychain}" 2>/dev/null || true
+          # Keep temp keychain first in search list (login.keychain can steal focus).
+          EXISTING=$(security list-keychains -d user 2>/dev/null | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | tr '\n' ' ')
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "${keychain}" ${EXISTING} >/dev/null 2>&1 || true
+          # Warm Securityd identity cache
+          security find-identity -v -p codesigning "${keychain}" >/dev/null 2>&1 || true
         }
 
         retry_codesign() {
@@ -341,18 +348,41 @@ runs:
           #   - Contents/*.4DZ (Internal User Components)
           #   - Contents/README.md (Internal Components/runtime.4dbase)
           # No --options=runtime / entitlements — these are data files, not executables.
+          #
+          # Large .4DZ on self-hosted Macs often hit errSecInternalComponent on in-place
+          # --force. Mitigations: strip xattrs, sign a /tmp copy, stronger keychain refresh,
+          # more attempts with capped backoff.
           sign_opaque() {
             local target="$1"
-            local out st attempt=1 max_attempts=5 delay=5
+            local out st attempt=1 max_attempts=8 delay=3
+            local tmpdir tmpfile
+            xattr -cr "$target" 2>/dev/null || true
+            refresh_keychain_access
             while [ $attempt -le $max_attempts ]; do
               echo "📄 Sign opaque [$attempt/$max_attempts]: $target"
-              out=$(codesign --force --sign "${sign}" --keychain "${keychain}" --timestamp "$target" 2>&1)
+              tmpdir=$(mktemp -d /tmp/opaque-sign.XXXXXX)
+              tmpfile="$tmpdir/$(basename "$target")"
+              # Fresh copy avoids resource-fork / in-place rewrite flakes on large blobs.
+              if ! cp -f "$target" "$tmpfile"; then
+                rm -rf "$tmpdir"
+                echo "❌ Opaque: copie temporaire impossible: $target"
+                return 1
+              fi
+              xattr -cr "$tmpfile" 2>/dev/null || true
+              out=$(codesign --force --sign "${sign}" --keychain "${keychain}" --timestamp "$tmpfile" 2>&1)
               st=$?
               echo "$out"
               if [ "$st" -eq 0 ]; then
+                if ! mv -f "$tmpfile" "$target"; then
+                  rm -rf "$tmpdir"
+                  echo "❌ Opaque: remplacement impossible: $target"
+                  return 1
+                fi
+                rm -rf "$tmpdir"
                 echo "✅ Opaque signé: $target"
                 return 0
               fi
+              rm -rf "$tmpdir"
               if echo "$out" | grep -qiE "errSecInternalComponent|CSSMERR_CSP_DISABLED|CSSM_ERRCODE_OPERATION_AUTH_DENIED"; then
                 refresh_keychain_access
               elif echo "$out" | grep -qiE "no identity found|not found in keychain"; then
@@ -363,6 +393,7 @@ runs:
               attempt=$(( attempt + 1 ))
               sleep $delay
               delay=$(( delay * 2 ))
+              if [ "$delay" -gt 30 ]; then delay=30; fi
             done
             echo "❌ Échec signature opaque: $target"
             return 1
