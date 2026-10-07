@@ -70,9 +70,32 @@ runs:
 
         echo "🔎 Scan WebViewerCEF sous le produit uniquement: $product_path"
 
+        # Fast path: if no helper still has an EXE or CEF symlink, do not touch anything
+        # (avoids invalidating intact Developer ID seals → far more codesign skips later).
+        SYMS=$(find "$product_path" -type l \( \
+          -path '*/4D Helper*.app/Contents/MacOS/*' -o \
+          -path '*/4D Helper*.app/Contents/Frameworks/Chromium Embedded Framework.framework' \
+        \) -print -quit 2>/dev/null || true)
+        if [ -z "$SYMS" ]; then
+          # Also need a real CEF dir when helpers exist (missing CEF still requires fix)
+          MISSING_CEF=0
+          while IFS= read -r -d '' APP; do
+            DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+            if [ ! -d "$DEST_CEF" ]; then
+              MISSING_CEF=1
+              break
+            fi
+          done < <(find "$product_path" -type d -name "4D Helper*.app" -print0 2>/dev/null)
+          if [ "$MISSING_CEF" -eq 0 ]; then
+            echo "⏭️ Helpers déjà normalisés (pas de symlink EXE/CEF) — skip CEF normalize"
+            exit 0
+          fi
+        fi
+
         py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
 
         FOUND=0
+        MUTATED=0
         while IFS= read -r -d '' BUNDLE_ROOT; do
           FOUND=1
           echo "📦 Bundle: $BUNDLE_ROOT"
@@ -85,9 +108,21 @@ runs:
           while IFS= read -r -d '' APP; do
             NAME="$(basename "$APP" .app)"
             EXE="$APP/Contents/MacOS/$NAME"
+            DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+
+            need_exe=0
+            need_cef=0
+            [ -L "$EXE" ] && need_exe=1
+            if [ -L "$DEST_CEF" ] || [ ! -d "$DEST_CEF" ]; then
+              need_cef=1
+            fi
+            if [ "$need_exe" -eq 0 ] && [ "$need_cef" -eq 0 ]; then
+              echo "⏭️ Helper OK (déjà local): $APP"
+              continue
+            fi
 
             # 1) L'exécutable principal ne doit pas être un symlink
-            if [ -L "$EXE" ]; then
+            if [ "$need_exe" -eq 1 ]; then
               TGT="$(readlink "$EXE")"
               RESOLVED=$(python3 -c "$py_resolve" "$(dirname "$EXE")" "$TGT")
               if [ ! -f "$RESOLVED" ]; then
@@ -97,17 +132,20 @@ runs:
               rm -f "$EXE"
               /usr/bin/ditto "$RESOLVED" "$EXE"
               chmod 755 "$EXE"
+              MUTATED=$((MUTATED + 1))
             fi
 
             # 2) Chaque helper doit avoir sa copie locale du framework CEF
-            DEST_CEF="$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
-            if [ -L "$DEST_CEF" ]; then
-              echo "🪄 Supprime symlink CEF dans $APP"
-              rm -f "$DEST_CEF"
-            fi
-            if [ ! -d "$DEST_CEF" ]; then
-              echo "📚 Copie CEF local dans: $DEST_CEF"
-              /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
+            if [ "$need_cef" -eq 1 ]; then
+              if [ -L "$DEST_CEF" ]; then
+                echo "🪄 Supprime symlink CEF dans $APP"
+                rm -f "$DEST_CEF"
+              fi
+              if [ ! -d "$DEST_CEF" ]; then
+                echo "📚 Copie CEF local dans: $DEST_CEF"
+                /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
+                MUTATED=$((MUTATED + 1))
+              fi
             fi
 
           done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
@@ -116,6 +154,8 @@ runs:
 
         if [ $FOUND -eq 0 ]; then
           echo "ℹ️ Aucun WebViewerCEF.bundle trouvé sous le produit (ce n’est pas bloquant)"
+        else
+          echo "ℹ️ CEF normalize: mutations=$MUTATED"
         fi
 
     - name: Preflight — aucun exécutable de helper ne doit être un symlink
