@@ -51,13 +51,24 @@ runs:
         path: ${{ inputs.product_path }}
         entitlements_url: 'https://raw.githubusercontent.com/miyako/4D/v1/entitlements.plist'
 
-    - name: Normalize ALL WebViewerCEF bundles (helpers exec must not be symlinks)
+    # Only normalize the product being signed — never tools/ or the whole workspace.
+    # Scanning GITHUB_WORKSPACE used to ditto CEF into tool4d_* copies (useless) and
+    # could mutate a sibling Client.app during Archive ZIP codesign.
+    - name: Normalize WebViewerCEF helpers (product only)
       shell: bash
+      env:
+        PRODUCT_PATH: ${{ inputs.product_path }}
       run: |
         set -euo pipefail
         shopt -s nullglob
 
-        echo "🔎 Scan des répertoires *WebViewerCEF.bundle/Contents/Frameworks* dans ${GITHUB_WORKSPACE}"
+        product_path="${PRODUCT_PATH%/}"
+        if [ ! -d "$product_path" ]; then
+          echo "ℹ️ Skip CEF normalize (product n'est pas un dossier): $product_path"
+          exit 0
+        fi
+
+        echo "🔎 Scan WebViewerCEF sous le produit uniquement: $product_path"
 
         py_resolve='import os,sys; base=sys.argv[1]; tgt=sys.argv[2]; print(os.path.abspath(os.path.join(base, tgt)))'
 
@@ -101,16 +112,24 @@ runs:
 
           done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
 
-        done < <(find "${GITHUB_WORKSPACE}" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
+        done < <(find "$product_path" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
 
         if [ $FOUND -eq 0 ]; then
-          echo "ℹ️ Aucun WebViewerCEF.bundle trouvé (ce n’est pas bloquant)"
+          echo "ℹ️ Aucun WebViewerCEF.bundle trouvé sous le produit (ce n’est pas bloquant)"
         fi
 
     - name: Preflight — aucun exécutable de helper ne doit être un symlink
       shell: bash
+      env:
+        PRODUCT_PATH: ${{ inputs.product_path }}
       run: |
         set -euo pipefail
+        product_path="${PRODUCT_PATH%/}"
+        if [ ! -d "$product_path" ]; then
+          echo "ℹ️ Skip helper symlink preflight (product n'est pas un dossier)"
+          exit 0
+        fi
+
         SYMLINKS_FOUND=0
 
         while IFS= read -r -d '' SYM; do
@@ -119,13 +138,13 @@ runs:
           fi
           echo " - $SYM"
           SYMLINKS_FOUND=1
-        done < <(find "${GITHUB_WORKSPACE}" -type l -path "*/4D Helper*.app/Contents/MacOS/*" -print0)
+        done < <(find "$product_path" -type l -path "*/4D Helper*.app/Contents/MacOS/*" -print0)
 
         if [ $SYMLINKS_FOUND -eq 1 ]; then
           exit 1
         fi
 
-        echo "✅ OK — aucun symlink executable dans les helpers"
+        echo "✅ OK — aucun symlink executable dans les helpers du produit"
 
     - name: Codesign
       shell: bash
@@ -671,7 +690,15 @@ runs:
             rm -rf "$work"
             return 0
           fi
-          echo "ℹ️ Archive root non valide — fix helper exec + CEF symlinks relatifs + sign + recompress (sans copies CEF)"
+          # Slim Upgrade4DClient ZIPs often fail root --verify (CEF external symlinks)
+          # while every Mach-O already has Developer ID + timestamp (e.g. copied from a
+          # Client.app that was just codesigned). Skip the ~10 min resign+rezip then.
+          if verify_macho_signatures_under "$sign_root" "early-exit:$archive"; then
+            echo "✅ Archive Mach-Os déjà valides (slim layout) — pas de re-signature ni recompress"
+            rm -rf "$work"
+            return 0
+          fi
+          echo "ℹ️ Archive non valide — fix helper exec + CEF symlinks relatifs + sign + recompress (sans copies CEF)"
 
           normalize_helpers_slim_under "$sign_root" || { rm -rf "$work"; return 1; }
           sign_bundle_tree "$sign_root" || { rm -rf "$work"; return 1; }
