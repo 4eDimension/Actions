@@ -148,9 +148,28 @@ runs:
           esac
         }
 
+        # Expected TeamIdentifier from workflow (Apple Developer Team ID).
+        # Used for logging; skip accepts any Developer ID Application + timestamp so
+        # pre-signed 4D/CEF binaries are not re-sent to Apple's TSA.
+        EXPECTED_TEAM="${team_id:-}"
+        echo "ℹ️ Codesign optimize: skip if Developer ID + timestamp (workflow team_id=${EXPECTED_TEAM:-unset})"
+
+        # True when target already has Developer ID Application + secure timestamp.
+        # Avoids --force re-sign (each TSA round-trip costs ~1–3s × hundreds of leaves).
+        # Accepts any Developer ID team so pre-signed 4D/CEF binaries are not re-signed.
+        already_signed_ok() {
+          local target="$1"
+          local info
+          [ -e "$target" ] || return 1
+          info=$(codesign -dv --verbose=2 "$target" 2>&1 || true)
+          echo "$info" | grep -q "Authority=Developer ID Application" || return 1
+          echo "$info" | grep -q "Timestamp=" || return 1
+          return 0
+        }
+
         # codesign: never use --deep on leaf Mach-O files. --deep on Contents/MacOS/<app>
         # seals the whole bundle; later mutations (or hardlinked CEF copies) invalidate it.
-        # Use deep only when sealing a bundle/framework container.
+        # After inside-out signing, seal containers WITHOUT --deep (do not re-walk the tree).
         refresh_keychain_access() {
           # Mitigate intermittent errSecInternalComponent on self-hosted Macs:
           # Security framework / keychain ACL can flake mid-job; re-unlock + partition list.
@@ -273,6 +292,11 @@ runs:
               echo "⏭️  Skip hardlink (inode $inode already signed): $f"
               return 0
             fi
+            if already_signed_ok "$f"; then
+              echo "⏭️  Skip leaf (Developer ID + timestamp): $f"
+              [ -n "$inode" ] && echo "$inode" >> "$inode_log"
+              return 0
+            fi
             echo "🔧 Signing leaf: $f"
             retry_codesign "$f" "--timestamp" "" || return 1
             [ -n "$inode" ] && echo "$inode" >> "$inode_log"
@@ -321,25 +345,36 @@ runs:
             sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -path "*/Library/LaunchServices/*" -o -path "*/XPCServices/*" \))
 
+          # Seal a container if not already valid (Developer ID + timestamp + verify).
+          seal_container() {
+            local target="$1"
+            local label="$2"
+            if already_signed_ok "$target" && codesign --verify --strict "$target" >/dev/null 2>&1; then
+              echo "⏭️  Skip $label (already sealed): $target"
+              return 0
+            fi
+            echo "📘 Seal $label: $target"
+            retry_codesign "$target" "--timestamp" "" || return 1
+          }
+
           # 2) Seal frameworks deepest-first (no --deep: leaves already signed)
           while IFS= read -r fw; do
             [ -n "$fw" ] || continue
-            echo "📘 Seal framework: $fw"
-            retry_codesign "$fw" "--timestamp" "" || { rm -f "$inode_log"; return 1; }
+            seal_container "$fw" "framework" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.framework")
 
           # 3) Seal bundles / plugins / kext deepest-first
           while IFS= read -r bp; do
             [ -n "$bp" ] || continue
-            echo "🔌 Seal bundle/plugin/kext: $bp"
-            retry_codesign "$bp" "--timestamp" "" || { rm -f "$inode_log"; return 1; }
+            seal_container "$bp" "bundle/plugin/kext" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \))
 
           # 4) Seal nested .app deepest-first
           while IFS= read -r app; do
             [ -n "$app" ] || continue
-            echo "📦 Seal nested .app: $app"
-            retry_codesign "$app" "--timestamp" "" || { rm -f "$inode_log"; return 1; }
+            # Skip sealing the root bundle here — done in step 5 / étape 3
+            [ "$app" = "$bundle" ] && continue
+            seal_container "$app" "nested .app" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.app")
 
           # 4b) Opaque-sign non-Mach-O nested payloads before sealing a .4dbase/.bundle.
@@ -356,6 +391,10 @@ runs:
             local target="$1"
             local out st attempt=1 max_attempts=8 delay=3
             local tmpdir tmpfile
+            if already_signed_ok "$target"; then
+              echo "⏭️  Skip opaque (Developer ID + timestamp): $target"
+              return 0
+            fi
             xattr -cr "$target" 2>/dev/null || true
             refresh_keychain_access
             while [ $attempt -le $max_attempts ]; do
@@ -420,7 +459,15 @@ runs:
             done < <(find -P "$bundle/Contents" -maxdepth 1 -type f -print)
           fi
 
-          rm -f "$inode_log"
+          # 4c) Seal nested *.4dbase with Contents/Info.plist (4D 20R8+ component layout).
+          # Étape 2 used to re-run sign_bundle_tree on each of these; after this seal,
+          # directory packages only need preflight.
+          while IFS= read -r db; do
+            [ -n "$db" ] || continue
+            [ "$db" = "$bundle" ] && continue
+            [ -f "$db/Contents/Info.plist" ] || continue
+            seal_container "$db" "nested .4dbase" || { rm -f "$inode_log"; return 1; }
+          done < <(deepest_first "$bundle" -type d -name "*.4dbase")
 
           # 5) Sign root MacOS binaries then seal package
           # Support both layouts:
@@ -433,8 +480,7 @@ runs:
             if [ -d "$bundle/Contents/MacOS" ]; then
               while IFS= read -r mainbin; do
                 [ -n "$mainbin" ] || continue
-                echo "🔧 Signing root MacOS binary: $mainbin"
-                retry_codesign "$mainbin" "--timestamp" "" || return 1
+                sign_leaf_once "$mainbin" || { rm -f "$inode_log"; return 1; }
               done < <(find -P "$bundle/Contents/MacOS" -maxdepth 1 -type f -print)
             fi
           elif [ -f "$bundle/Info.plist" ] && [ -d "$bundle/MacOS" ]; then
@@ -442,14 +488,14 @@ runs:
             seal_target="$(dirname "$bundle")"
             while IFS= read -r mainbin; do
               [ -n "$mainbin" ] || continue
-              echo "🔧 Signing root MacOS binary: $mainbin"
-              retry_codesign "$mainbin" "--timestamp" "" || return 1
+              sign_leaf_once "$mainbin" || { rm -f "$inode_log"; return 1; }
             done < <(find -P "$bundle/MacOS" -maxdepth 1 -type f -print)
           fi
 
+          rm -f "$inode_log"
+
           if [ -n "$seal_target" ] && [ -f "$seal_target/Contents/Info.plist" ]; then
-            echo "📦 Signature finale du package: $seal_target"
-            retry_codesign "$seal_target" "--timestamp" "" || return 1
+            seal_container "$seal_target" "package root" || return 1
             if ! codesign --verify --verbose --strict "$seal_target" 2>&1; then
               echo "❌ codesign --verify échoué après signature finale: $seal_target"
               return 1
@@ -726,12 +772,14 @@ runs:
           echo "=== Skipping étape 1 (product_path is not a directory): ${product_path} ==="
         fi
 
-        # === Étape 2 : Codesign de l'intérieur des archives (4darchive / 4dbase), y compris ZIP ===
-        echo "=== Signing contents of .4dbase and .4darchive ==="
+        # === Étape 2 : ZIP archives only (extract / sign / recompress) ===
+        # Directory *.4dbase / *.4darchive are already covered by étape 1
+        # (leaves + opaque + nested .4dbase seal). Re-running sign_bundle_tree
+        # on each of them used to cost ~6–30 min of duplicate TSA round-trips.
+        echo "=== Signing ZIP .4dbase / .4darchive (directories → preflight only) ==="
         TREATED_ARCHIVES=()
 
-        collect_and_sign_archives() {
-          local path
+        collect_archives() {
           # product_path itself is a directory package
           if [[ -d "${product_path}" && ( "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ) ]]; then
             printf '%s\0' "${product_path}"
@@ -741,7 +789,7 @@ runs:
             printf '%s\0' "${product_path}"
           fi
           if [ -d "${product_path}" ]; then
-            # Nested directory packages
+            # Nested directory packages (preflight only — signed in étape 1)
             find -L "${product_path}" -mindepth 1 -type d \( -name "*.4dbase" -o -name "*.4darchive" \) -print0
             # Nested ZIP archives (e.g. Upgrade4DClient/update.mac.4darchive)
             find -L "${product_path}" -mindepth 1 -type f \( -name "*.4darchive" -o -name "*.4dbase" \) -print0
@@ -753,7 +801,7 @@ runs:
             continue
           fi
           if [ -d "$bundle" ]; then
-            sign_bundle_tree "$bundle" || exit 1
+            echo "ℹ️ Directory package — skip re-sign (étape 1), preflight only: $bundle"
             TREATED_ARCHIVES+=("$bundle")
           elif is_zip_file "$bundle"; then
             prepare_and_sign_zip_4darchive "$bundle" || exit 1
@@ -761,7 +809,7 @@ runs:
           else
             echo "⚠️ Ignoré (ni dossier ni ZIP): $bundle"
           fi
-        done < <(collect_and_sign_archives)
+        done < <(collect_archives)
 
         # === Preflight: fail fast before DMG/notary if nested archives still unsigned ===
         echo "=== Preflight nested archives after signing ==="
@@ -793,44 +841,27 @@ runs:
           fi
         fi
 
-        # === Étape 2.5 : passe de rattrapage des dylibs (Developer ID + timestamp) ===
-        # Uniquement sur arbres disque (pas à l'intérieur des ZIP déjà recompressés).
-        # Important: when product_path IS a .4dbase (4DZ ARM), top-level Libraries/*.dylib
-        # must be checked — do not use ! -path "*.4dbase/*" which would exclude them all.
+        # === Étape 2.5 : sanity pass dylibs (verify léger, re-sign seulement si manquant) ===
+        # Nested *.4dbase/* already covered by preflight — skip them here.
+        # Top-level Libraries/*.dylib when product_path IS a .4dbase must still be checked.
         if [ -d "${product_path}" ]; then
           echo "=== Dylib signature sanity pass ==="
           while IFS= read -r -d '' dylib; do
             if is_under_nested_archive "$dylib"; then
               continue
             fi
-            sig_info=$(codesign -dv --verbose=4 "$dylib" 2>&1 || true)
-            has_developer_id=0
-            has_timestamp=0
-
-            if echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
-              has_developer_id=1
+            if already_signed_ok "$dylib"; then
+              continue
             fi
-            if echo "$sig_info" | grep -q "Timestamp="; then
-              has_timestamp=1
-            fi
-
-            if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
-              echo "⚠️ Re-signature requise: $dylib"
-              retry_codesign "$dylib" "--timestamp" "" || exit 1
-
-              sig_info=$(codesign -dv --verbose=4 "$dylib" 2>&1 || true)
-              if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
-                echo "❌ Signature invalide (Developer ID absent) après re-signature: $dylib"
-                exit 1
-              fi
-              if ! echo "$sig_info" | grep -q "Timestamp="; then
-                echo "❌ Signature invalide (timestamp absent) après re-signature: $dylib"
-                exit 1
-              fi
+            echo "⚠️ Re-signature requise: $dylib"
+            retry_codesign "$dylib" "--timestamp" "" || exit 1
+            if ! already_signed_ok "$dylib"; then
+              echo "❌ Signature invalide (Developer ID / timestamp) après re-signature: $dylib"
+              exit 1
             fi
           done < <(find "${product_path}" -type f -name "*.dylib" -print0)
 
-          # === Étape 2.6 : passe de rattrapage des binaires principaux de frameworks ===
+          # === Étape 2.6 : sanity pass binaires principaux de frameworks ===
           echo "=== Framework main binary signature sanity pass ==="
           while IFS= read -r -d '' fw; do
             if is_under_nested_archive "$fw"; then
@@ -856,49 +887,41 @@ runs:
               continue
             fi
 
-            sig_info=$(codesign -dv --verbose=4 "$main_bin" 2>&1 || true)
-            has_developer_id=0
-            has_timestamp=0
-
-            if echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
-              has_developer_id=1
+            if already_signed_ok "$main_bin"; then
+              continue
             fi
-            if echo "$sig_info" | grep -q "Timestamp="; then
-              has_timestamp=1
-            fi
-
-            if [[ $has_developer_id -eq 0 || $has_timestamp -eq 0 ]]; then
-              echo "⚠️ Re-signature framework main binary requise: $main_bin"
-              retry_codesign "$main_bin" "--timestamp" "" || exit 1
-
-              sig_info=$(codesign -dv --verbose=4 "$main_bin" 2>&1 || true)
-              if ! echo "$sig_info" | grep -q "Authority=Developer ID Application"; then
-                echo "❌ Signature framework invalide (Developer ID absent) après re-signature: $main_bin"
-                exit 1
-              fi
-              if ! echo "$sig_info" | grep -q "Timestamp="; then
-                echo "❌ Signature framework invalide (timestamp absent) après re-signature: $main_bin"
-                exit 1
-              fi
+            echo "⚠️ Re-signature framework main binary requise: $main_bin"
+            retry_codesign "$main_bin" "--timestamp" "" || exit 1
+            if ! already_signed_ok "$main_bin"; then
+              echo "❌ Signature framework invalide après re-signature: $main_bin"
+              exit 1
             fi
           done < <(find -L "${product_path}" -type d -name "*.framework" -print0)
         else
           echo "=== Skipping dylib/framework sanity passes (product_path is not a directory) ==="
         fi
 
-        # === Étape 3 : signature finale du bundle racine (app / composant 4D) ===
-        # product_path already trimmed at script start.
+        # === Étape 3 : seal racine SANS --deep (inside-out déjà fait) ===
+        # --deep retraverse tout l'arbre et re-envoie chaque nested code au TSA.
         if [[ "${product_path}" == *.app ]]; then
-          echo "📦 Signature finale de l’app principale : ${product_path}"
-          retry_codesign "${product_path}" "--timestamp" "--deep" || exit 1
+          echo "📦 Signature finale de l’app principale (no --deep): ${product_path}"
+          if already_signed_ok "${product_path}" && codesign --verify --strict "${product_path}" >/dev/null 2>&1; then
+            echo "⏭️  Root app déjà scellée — skip"
+          else
+            retry_codesign "${product_path}" "--timestamp" "" || exit 1
+          fi
         elif [[ -d "${product_path}" && ( "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ) ]]; then
           # Depuis 4D 20R8, un composant utilisant la structure "Contents/Info.plist" doit être
           # signé en tant que bundle racine, faute de quoi macOS ne génère jamais
           # Contents/_CodeSignature ("code object is not signed at all"). Les structures historiques
           # (plates, sans Contents/Info.plist) ne sont pas concernées et restent inchangées.
           if [ -f "${product_path}/Contents/Info.plist" ]; then
-            echo "📦 Structure Contents/Info.plist détectée — signature finale du bundle : ${product_path}"
-            retry_codesign "${product_path}" "--timestamp" "--deep" || exit 1
+            echo "📦 Structure Contents/Info.plist détectée — seal racine (no --deep): ${product_path}"
+            if already_signed_ok "${product_path}" && codesign --verify --strict "${product_path}" >/dev/null 2>&1; then
+              echo "⏭️  Root .4dbase déjà scellé — skip"
+            else
+              retry_codesign "${product_path}" "--timestamp" "" || exit 1
+            fi
           else
             echo "ℹ️ ${product_path} : structure historique (plate, sans Contents/Info.plist) — pas de signature de bundle racine."
           fi
@@ -912,6 +935,7 @@ runs:
         sign: ${{ inputs.sign }}
         keychain: ${{ inputs.keychain }}
         product_path: ${{ inputs.product_path }}
+        team_id: ${{ inputs.team_id }}
         entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
 
     - name: hdiutil (sparse -> convert)
