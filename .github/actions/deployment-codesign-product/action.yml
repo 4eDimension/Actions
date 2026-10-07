@@ -154,13 +154,17 @@ runs:
         EXPECTED_TEAM="${team_id:-}"
         echo "ℹ️ Codesign optimize: skip if Developer ID + timestamp (workflow team_id=${EXPECTED_TEAM:-unset})"
 
-        # True when target already has Developer ID Application + secure timestamp.
-        # Avoids --force re-sign (each TSA round-trip costs ~1–3s × hundreds of leaves).
-        # Accepts any Developer ID team so pre-signed 4D/CEF binaries are not re-signed.
+        # True when target already has Developer ID Application + secure timestamp
+        # AND codesign --verify --strict succeeds.
+        # -dv alone is not enough: after Normalize copies CEF into helpers, nested
+        # seals break while -dv still shows Authority/Timestamp → Apple notary
+        # "The signature of the binary is invalid."
+        # Accepts any Developer ID team so intact pre-signed 4D/CEF binaries skip TSA.
         already_signed_ok() {
           local target="$1"
           local info
           [ -e "$target" ] || return 1
+          codesign --verify --strict "$target" >/dev/null 2>&1 || return 1
           info=$(codesign -dv --verbose=2 "$target" 2>&1 || true)
           echo "$info" | grep -q "Authority=Developer ID Application" || return 1
           echo "$info" | grep -q "Timestamp=" || return 1
@@ -349,7 +353,7 @@ runs:
           seal_container() {
             local target="$1"
             local label="$2"
-            if already_signed_ok "$target" && codesign --verify --strict "$target" >/dev/null 2>&1; then
+            if already_signed_ok "$target"; then
               echo "⏭️  Skip $label (already sealed): $target"
               return 0
             fi
@@ -363,13 +367,11 @@ runs:
             seal_container "$fw" "framework" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.framework")
 
-          # 3) Seal bundles / plugins / kext deepest-first
-          while IFS= read -r bp; do
-            [ -n "$bp" ] || continue
-            seal_container "$bp" "bundle/plugin/kext" || { rm -f "$inode_log"; return 1; }
-          done < <(deepest_first "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \))
-
-          # 4) Seal nested .app deepest-first
+          # 3) Seal nested .app deepest-first BEFORE parent .bundle.
+          # Normalize copies CEF into 4D Helper*.app inside WebViewerCEF.bundle; those
+          # helpers must be re-sealed first. Sealing WebViewerCEF.bundle before helpers
+          # (then skipping the bundle) left an invalid parent seal → notary Invalid on
+          # WebViewerCEF.bundle/Contents/MacOS/WebViewerCEF (seen on AutoTestExec 21R4).
           while IFS= read -r app; do
             [ -n "$app" ] || continue
             # Skip sealing the root bundle here — done in step 5 / étape 3
@@ -377,7 +379,7 @@ runs:
             seal_container "$app" "nested .app" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.app")
 
-          # 4b) Opaque-sign non-Mach-O nested payloads before sealing a .4dbase/.bundle.
+          # 4) Opaque-sign non-Mach-O nested payloads before sealing a .4dbase/.bundle.
           # Apple treats unexpected files directly under Contents/ as nested code objects
           # ("code object is not signed at all / In subcomponent: …"). Seen on 4D main:
           #   - Contents/*.4DZ (Internal User Components)
@@ -468,6 +470,13 @@ runs:
             [ -f "$db/Contents/Info.plist" ] || continue
             seal_container "$db" "nested .4dbase" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.4dbase")
+
+          # 4d) Seal bundles / plugins / kext LAST among nested containers so parent
+          # WebViewerCEF.bundle is re-sealed after helper .app seals (verify fails → no skip).
+          while IFS= read -r bp; do
+            [ -n "$bp" ] || continue
+            seal_container "$bp" "bundle/plugin/kext" || { rm -f "$inode_log"; return 1; }
+          done < <(deepest_first "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \))
 
           # 5) Sign root MacOS binaries then seal package
           # Support both layouts:
@@ -905,7 +914,7 @@ runs:
         # --deep retraverse tout l'arbre et re-envoie chaque nested code au TSA.
         if [[ "${product_path}" == *.app ]]; then
           echo "📦 Signature finale de l’app principale (no --deep): ${product_path}"
-          if already_signed_ok "${product_path}" && codesign --verify --strict "${product_path}" >/dev/null 2>&1; then
+          if already_signed_ok "${product_path}"; then
             echo "⏭️  Root app déjà scellée — skip"
           else
             retry_codesign "${product_path}" "--timestamp" "" || exit 1
@@ -917,7 +926,7 @@ runs:
           # (plates, sans Contents/Info.plist) ne sont pas concernées et restent inchangées.
           if [ -f "${product_path}/Contents/Info.plist" ]; then
             echo "📦 Structure Contents/Info.plist détectée — seal racine (no --deep): ${product_path}"
-            if already_signed_ok "${product_path}" && codesign --verify --strict "${product_path}" >/dev/null 2>&1; then
+            if already_signed_ok "${product_path}"; then
               echo "⏭️  Root .4dbase déjà scellé — skip"
             else
               retry_codesign "${product_path}" "--timestamp" "" || exit 1
