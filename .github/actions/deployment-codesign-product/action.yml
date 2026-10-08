@@ -152,21 +152,18 @@ runs:
             fi
 
             # 2) Each helper needs a local CEF framework (notary rejects external symlinks).
-            # Prefer hardlink tree (cp -al): same inodes → CEF Mach-O seals stay valid.
-            # Fall back to ditto only when hardlinks are impossible (cross-volume).
+            # Must be a real copy (ditto), NOT hardlinks: Apple notary rejects shared-inode
+            # CEF across 4D Helper*.app ("signature of the binary is invalid") — seen on
+            # AutoTestExec v20 after cp -al normalize (Client + Server DMGs Invalid).
+            # ditto preserves Mach-O code directory bytes; helpers/WebViewerCEF are re-sealed below.
             if [ "$need_cef" -eq 1 ]; then
               if [ -L "$DEST_CEF" ]; then
                 echo "🪄 Supprime symlink CEF dans $APP"
                 rm -f "$DEST_CEF"
               fi
               if [ ! -d "$DEST_CEF" ]; then
-                mkdir -p "$(dirname "$DEST_CEF")"
-                if cp -aR -l "$SRC_CEF" "$DEST_CEF" 2>/dev/null; then
-                  echo "📚 CEF hardlink tree → $DEST_CEF (seals préservés)"
-                else
-                  echo "📚 CEF ditto (hardlink impossible) → $DEST_CEF"
-                  /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
-                fi
+                echo "📚 Copie CEF local (ditto) dans: $DEST_CEF"
+                /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
                 MUTATED=$((MUTATED + 1))
               fi
             fi
@@ -1070,15 +1067,12 @@ runs:
         MOUNT_DIR="${WORKDIR}/mnt"
         mkdir -p "$MOUNT_DIR"
 
-        # Estimation taille. du counts hardlinked inodes once — matches rsync -aH.
-        # (rsync -a WITHOUT -H expands hardlinks and blew the sparse image after CEF
-        #  cp -al normalize: "No space left on device" on AutoTestExec Server.)
         SRC_KB=$(du -sk "$SRC" | awk '{print $1}')
         SRC_MB=$(( SRC_KB / 1024 ))
         if [[ $SRC_MB -lt 1 ]]; then SRC_MB=1; fi
         NEEDED_MB=$(( SRC_MB + (SRC_MB * ${MARGIN_PCT} / 100) + ${EXTRA_MB} ))
         if [[ $NEEDED_MB -lt 300 ]]; then NEEDED_MB=300; fi
-        echo "ℹ️ DMG size estimate: src=${SRC_MB}MB → sparse=${NEEDED_MB}MB (rsync -aH preserves hardlinks)"
+        echo "ℹ️ DMG size estimate: src=${SRC_MB}MB → sparse=${NEEDED_MB}MB"
 
         # Sparse + montage
         hdiutil create -type SPARSE -fs "${FS}" -volname "${VOLNAME}" -nospotlight \
@@ -1087,8 +1081,7 @@ runs:
         hdiutil attach "${WORKDIR}/staging.sparseimage" -nobrowse -noverify -noautoopen -owners on \
           -mountpoint "${MOUNT_DIR}"
 
-        # Preserve hardlinks (-H) so CEF hardlink trees fit the du-based image size
-        rsync -aH --delete "${SRC}" "${MOUNT_DIR}/"
+        rsync -a --delete "${SRC}" "${MOUNT_DIR}/"
 
         # Démontage
         sync
