@@ -1070,12 +1070,15 @@ runs:
         MOUNT_DIR="${WORKDIR}/mnt"
         mkdir -p "$MOUNT_DIR"
 
-        # Estimation taille
+        # Estimation taille. du counts hardlinked inodes once — matches rsync -aH.
+        # (rsync -a WITHOUT -H expands hardlinks and blew the sparse image after CEF
+        #  cp -al normalize: "No space left on device" on AutoTestExec Server.)
         SRC_KB=$(du -sk "$SRC" | awk '{print $1}')
         SRC_MB=$(( SRC_KB / 1024 ))
         if [[ $SRC_MB -lt 1 ]]; then SRC_MB=1; fi
         NEEDED_MB=$(( SRC_MB + (SRC_MB * ${MARGIN_PCT} / 100) + ${EXTRA_MB} ))
         if [[ $NEEDED_MB -lt 300 ]]; then NEEDED_MB=300; fi
+        echo "ℹ️ DMG size estimate: src=${SRC_MB}MB → sparse=${NEEDED_MB}MB (rsync -aH preserves hardlinks)"
 
         # Sparse + montage
         hdiutil create -type SPARSE -fs "${FS}" -volname "${VOLNAME}" -nospotlight \
@@ -1084,8 +1087,8 @@ runs:
         hdiutil attach "${WORKDIR}/staging.sparseimage" -nobrowse -noverify -noautoopen -owners on \
           -mountpoint "${MOUNT_DIR}"
 
-        # Copie
-        rsync -a --delete "${SRC}" "${MOUNT_DIR}/"
+        # Preserve hardlinks (-H) so CEF hardlink trees fit the du-based image size
+        rsync -aH --delete "${SRC}" "${MOUNT_DIR}/"
 
         # Démontage
         sync
