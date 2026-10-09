@@ -75,6 +75,10 @@ runs:
     # Only normalize the product being signed — never tools/ or the whole workspace.
     # Scanning GITHUB_WORKSPACE used to ditto CEF into tool4d_* copies (useless) and
     # could mutate a sibling Client.app during Archive ZIP codesign.
+    #
+    # NEVER fat-normalize update*.4darchive: clonefile CEF into helpers balloons the
+    # archive and turns SignArchive into a multi-hour SignApp (ATE v20 hung 3h+).
+    # Archives stay slim (relative CEF symlinks) — see normalize_helpers_slim_under.
     - name: Normalize WebViewerCEF helpers (product only)
       if: ${{ inputs.sign_product != 'false' }}
       shell: bash
@@ -95,6 +99,14 @@ runs:
           echo "ℹ️ Skip CEF normalize (product n'est pas un dossier): $product_path"
           exit 0
         fi
+
+        # Fat CEF copies are for notarized .app only — never for update archives.
+        case "$product_path" in
+          *.4darchive|*.4darchive/)
+            echo "⏭️ Skip fat CEF normalize on .4darchive (slim symlinks only — Codesign step)"
+            exit 0
+            ;;
+        esac
 
         echo "🔎 Scan WebViewerCEF sous le produit uniquement: $product_path"
 
@@ -922,6 +934,13 @@ runs:
         # (Normalize copies CEF into helpers), then abort on "code object is not signed".
         # sign_bundle_tree already does leaves → frameworks → bundles → apps deepest-first.
         if [ -d "${product_path}" ]; then
+          case "${product_path}" in
+            *.4darchive)
+              # Directory update archive: keep relative CEF symlinks (no fat copies).
+              echo "=== Slim-normalize directory .4darchive before sign_bundle_tree ==="
+              normalize_helpers_slim_under "${product_path}" || exit 1
+              ;;
+          esac
           echo "=== Signing all main components (sign_bundle_tree) ==="
           sign_bundle_tree "${product_path}" || exit 1
         else
