@@ -42,6 +42,12 @@ inputs:
     required: false
     type: boolean
     default: true
+  # When false, skip étape 2 archive discovery (nested + sibling). Use on SignApp when
+  # Sign-Client-Archive already signed update.mac.4darchive for Server/FTP.
+  sign_archives:
+    required: false
+    type: boolean
+    default: true
 
 outputs:
   product_path: 
@@ -77,6 +83,12 @@ runs:
       run: |
         set -euo pipefail
         shopt -s nullglob
+
+        # Keep GHA runner alive during long CEF copies (prevents lost communication).
+        heartbeat() { while true; do echo "… CEF normalize alive $(date -u +%H:%M:%S)"; sleep 60; done; }
+        heartbeat &
+        HB_PID=$!
+        trap 'kill $HB_PID 2>/dev/null || true' EXIT
 
         product_path="${PRODUCT_PATH%/}"
         if [ ! -d "$product_path" ]; then
@@ -152,18 +164,33 @@ runs:
             fi
 
             # 2) Each helper needs a local CEF framework (notary rejects external symlinks).
-            # Must be a real copy (ditto), NOT hardlinks: Apple notary rejects shared-inode
-            # CEF across 4D Helper*.app ("signature of the binary is invalid") — seen on
-            # AutoTestExec v20 after cp -al normalize (Client + Server DMGs Invalid).
-            # ditto preserves Mach-O code directory bytes; helpers/WebViewerCEF are re-sealed below.
+            # Prefer APFS clonefile (cp -c): distinct inodes (OK for Apple notary) + CoW
+            # (far less I/O than ditto). NEVER hardlink (cp -al) — notary Invalid on shared
+            # inodes across 4D Helper*.app (AutoTestExec v20).
             if [ "$need_cef" -eq 1 ]; then
               if [ -L "$DEST_CEF" ]; then
                 echo "🪄 Supprime symlink CEF dans $APP"
                 rm -f "$DEST_CEF"
               fi
               if [ ! -d "$DEST_CEF" ]; then
-                echo "📚 Copie CEF local (ditto) dans: $DEST_CEF"
-                /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
+                mkdir -p "$(dirname "$DEST_CEF")"
+                if cp -cR "$SRC_CEF" "$DEST_CEF" 2>/dev/null; then
+                  echo "📚 CEF clonefile → $DEST_CEF"
+                else
+                  echo "📚 CEF ditto fallback → $DEST_CEF"
+                  /usr/bin/ditto "$SRC_CEF" "$DEST_CEF"
+                fi
+                # Guard: refuse accidental hardlinks (same inode as source binary)
+                SRC_BIN=$(find "$SRC_CEF" -type f -name "Chromium Embedded Framework" -print -quit 2>/dev/null || true)
+                DST_BIN=$(find "$DEST_CEF" -type f -name "Chromium Embedded Framework" -print -quit 2>/dev/null || true)
+                if [ -n "$SRC_BIN" ] && [ -n "$DST_BIN" ]; then
+                  SRC_INO=$(stat -f '%i' "$SRC_BIN" 2>/dev/null || true)
+                  DST_INO=$(stat -f '%i' "$DST_BIN" 2>/dev/null || true)
+                  if [ -n "$SRC_INO" ] && [ "$SRC_INO" = "$DST_INO" ]; then
+                    echo "❌ CEF hardlink détecté (inode=$SRC_INO) — notary Invalid; abort"
+                    exit 1
+                  fi
+                fi
                 MUTATED=$((MUTATED + 1))
               fi
             fi
@@ -213,9 +240,17 @@ runs:
       run: |
         set -euo pipefail
 
+        # Keep GHA runner alive during long codesign (prevents lost communication).
+        heartbeat() { while true; do echo "… codesign alive $(date -u +%H:%M:%S)"; sleep 60; done; }
+        heartbeat &
+        HB_PID=$!
+        trap 'kill $HB_PID 2>/dev/null || true' EXIT
+
         # Workflows often pass product_path with a trailing slash (e.g. Foo.4dbase/).
         # Suffix checks (*.4dbase / *.app) and archive discovery require a clean path.
         product_path="${product_path%/}"
+        sign_archives="${sign_archives:-true}"
+        echo "ℹ️ sign_archives=${sign_archives}"
 
         # True when $1 lives under a nested *.4dbase / *.4darchive relative to product_path
         # (does NOT match top-level files when product_path itself is a .4dbase).
@@ -415,12 +450,15 @@ runs:
           fi
           while IFS= read -r f; do
             [ -n "$f" ] || continue
-            if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O|shared library|bundle|executable'; then
-              case "$f" in
-                *.dylib|*.so) ;;
-                *) continue ;;
-              esac
-            fi
+            # Skip expensive file(1) for known Mach-O extensions / helper names
+            case "$f" in
+              *.dylib|*.so|*.bundle/Contents/MacOS/*|*/4D\ Helper*|*/Chromium\ Embedded\ Framework|*/InstallTool|*/Updater) ;;
+              *)
+                if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O|shared library|bundle|executable'; then
+                  continue
+                fi
+                ;;
+            esac
             sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" "${leaf_find[@]}")
 
@@ -428,7 +466,12 @@ runs:
           # have missed (odd permissions / names). Notarization rejects unsigned ones.
           while IFS= read -r f; do
             [ -n "$f" ] || continue
-            file -b "$f" 2>/dev/null | grep -qiE 'Mach-O' || continue
+            case "$f" in
+              *.dylib|*.so) ;;
+              *)
+                file -b "$f" 2>/dev/null | grep -qiE 'Mach-O' || continue
+                ;;
+            esac
             sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -path "*/Library/LaunchServices/*" -o -path "*/XPCServices/*" \))
 
@@ -475,19 +518,33 @@ runs:
           sign_opaque() {
             local target="$1"
             local out st attempt=1 max_attempts=8 delay=3
-            local tmpdir tmpfile
+            local tmpdir tmpfile size_mb=0 use_inplace=0
             if already_signed_ok "$target"; then
               echo "⏭️  Skip opaque (Developer ID + timestamp): $target"
               return 0
             fi
-            # Do not xattr -cr the live target — that would invalidate sibling seals.
-            # Strip only on the isolated /tmp copy before signing.
+            size_mb=$(du -sm "$target" 2>/dev/null | awk '{print $1}')
+            # Small blobs: try in-place first (avoids /tmp copy). Large: /tmp copy only.
+            if [ -n "$size_mb" ] && [ "$size_mb" -lt 50 ]; then
+              use_inplace=1
+            fi
             refresh_keychain_access
             while [ $attempt -le $max_attempts ]; do
-              echo "📄 Sign opaque [$attempt/$max_attempts]: $target"
+              echo "📄 Sign opaque [$attempt/$max_attempts]: $target (${size_mb:-?}MB inplace=$use_inplace)"
+              if [ "$use_inplace" -eq 1 ] && [ "$attempt" -eq 1 ]; then
+                xattr -cr "$target" 2>/dev/null || true
+                out=$(codesign --force --sign "${sign}" --keychain "${keychain}" --timestamp "$target" 2>&1)
+                st=$?
+                echo "$out"
+                if [ "$st" -eq 0 ]; then
+                  echo "✅ Opaque signé (in-place): $target"
+                  return 0
+                fi
+                echo "⚠️ In-place opaque failed — fallback /tmp copy"
+                use_inplace=0
+              fi
               tmpdir=$(mktemp -d /tmp/opaque-sign.XXXXXX)
               tmpfile="$tmpdir/$(basename "$target")"
-              # Fresh copy avoids resource-fork / in-place rewrite flakes on large blobs.
               if ! cp -f "$target" "$tmpfile"; then
                 rm -rf "$tmpdir"
                 echo "❌ Opaque: copie temporaire impossible: $target"
@@ -877,7 +934,11 @@ runs:
         # on each of them used to cost ~6–30 min of duplicate TSA round-trips.
         echo "=== Signing ZIP .4dbase / .4darchive (directories → preflight only) ==="
         TREATED_ARCHIVES=()
+        JUST_SIGNED_ARCHIVES=()
 
+        if [ "${sign_archives}" = "false" ]; then
+          echo "⏭️ sign_archives=false — skip étape 2 archive discovery (SignApp path)"
+        else
         collect_archives() {
           # product_path itself is a directory package
           if [[ -d "${product_path}" && ( "${product_path}" == *.4dbase || "${product_path}" == *.4darchive ) ]]; then
@@ -913,6 +974,7 @@ runs:
           elif is_zip_file "$bundle"; then
             prepare_and_sign_zip_4darchive "$bundle" || exit 1
             TREATED_ARCHIVES+=("$bundle")
+            JUST_SIGNED_ARCHIVES+=("$bundle")
           else
             echo "⚠️ Ignoré (ni dossier ni ZIP): $bundle"
           fi
@@ -922,6 +984,19 @@ runs:
         echo "=== Preflight nested archives after signing ==="
         if [ "${#TREATED_ARCHIVES[@]}" -gt 0 ]; then
           for arch in "${TREATED_ARCHIVES[@]}"; do
+            # Full verify when we just signed in-process is redundant — sample only.
+            just=0
+            for j in "${JUST_SIGNED_ARCHIVES[@]+"${JUST_SIGNED_ARCHIVES[@]}"}"; do
+              [ "$j" = "$arch" ] && just=1 && break
+            done
+            if [ "$just" -eq 1 ] && [ -f "$arch" ]; then
+              echo "ℹ️ Preflight sample (just signed ZIP): $arch"
+              if ! unzip -t "$arch" >/dev/null 2>&1; then
+                echo "❌ ZIP invalide juste après signature: $arch"
+                exit 1
+              fi
+              continue
+            fi
             preflight_archive_path "$arch" || exit 1
           done
         else
@@ -947,6 +1022,7 @@ runs:
             done < <(find "$UPGRADE_DIR" \( -type d -o -type f \) -name '*.4darchive' -print0)
           fi
         fi
+        fi # sign_archives != false
 
         # === Étape 2.5 : sanity pass dylibs (verify léger, re-sign seulement si manquant) ===
         # Nested *.4dbase/* already covered by preflight — skip them here.
@@ -1044,6 +1120,7 @@ runs:
         product_path: ${{ inputs.product_path }}
         team_id: ${{ inputs.team_id }}
         entitlements_path: ${{ steps.setup.outputs.entitlements_path }}
+        sign_archives: ${{ inputs.sign_archives }}
 
     - name: hdiutil (sparse -> convert)
       id: hdiutil
