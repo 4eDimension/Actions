@@ -292,15 +292,16 @@ runs:
           local mode="${2:-fast}"
           local info
           [ -e "$target" ] || return 1
-          # Cheap reject first (avoids -dv --verbose=2 on thousands of archive leaves).
-          if [ "$mode" = "strict" ]; then
-            codesign --verify --strict "$target" >/dev/null 2>&1 || return 1
-          else
-            codesign --verify --quiet "$target" >/dev/null 2>&1 || return 1
-          fi
+          # Fast path: -dv only (Authority + Timestamp). Do NOT require --verify --quiet
+          # first — it false-negatives on freshly signed nested dylibs (ATE v20 SignApp/
+          # Server: codesign OK then "Signature invalide après re-signature" on libxerces /
+          # lib4d-arm64) and forced useless CEF re-signs (errSecInternalComponent storms).
           info=$(codesign -dv --verbose=2 "$target" 2>&1 || true)
           echo "$info" | grep -q "Authority=Developer ID Application" || return 1
           echo "$info" | grep -q "Timestamp=" || return 1
+          if [ "$mode" = "strict" ]; then
+            codesign --verify --strict "$target" >/dev/null 2>&1 || return 1
+          fi
           return 0
         }
 
@@ -1070,8 +1071,13 @@ runs:
             fi
             echo "⚠️ Re-signature requise: $dylib"
             retry_codesign "$dylib" "--timestamp" "" || exit 1
+            # Brief pause: Apple TSA metadata can lag behind a successful codesign exit.
+            if ! already_signed_ok "$dylib"; then
+              sleep 2
+            fi
             if ! already_signed_ok "$dylib"; then
               echo "❌ Signature invalide (Developer ID / timestamp) après re-signature: $dylib"
+              codesign -dv --verbose=2 "$dylib" 2>&1 || true
               exit 1
             fi
           done < <(find "${product_path}" -type f -name "*.dylib" -print0)
