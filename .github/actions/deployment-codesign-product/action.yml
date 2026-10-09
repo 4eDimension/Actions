@@ -292,12 +292,15 @@ runs:
           local mode="${2:-fast}"
           local info
           [ -e "$target" ] || return 1
+          # Cheap reject first (avoids -dv --verbose=2 on thousands of archive leaves).
+          if [ "$mode" = "strict" ]; then
+            codesign --verify --strict "$target" >/dev/null 2>&1 || return 1
+          else
+            codesign --verify --quiet "$target" >/dev/null 2>&1 || return 1
+          fi
           info=$(codesign -dv --verbose=2 "$target" 2>&1 || true)
           echo "$info" | grep -q "Authority=Developer ID Application" || return 1
           echo "$info" | grep -q "Timestamp=" || return 1
-          if [ "$mode" = "strict" ]; then
-            codesign --verify --strict "$target" >/dev/null 2>&1 || return 1
-          fi
           return 0
         }
 
@@ -939,10 +942,20 @@ runs:
               # Directory update archive: keep relative CEF symlinks (no fat copies).
               echo "=== Slim-normalize directory .4darchive before sign_bundle_tree ==="
               normalize_helpers_slim_under "${product_path}" || exit 1
+              # BuildApp often leaves a valid root seal + 4D DevID leaves — full tree
+              # walk (codesign -dv × thousands) was 40+ min on ATE v20 SignArchive.
+              if archive_tree_verifies "${product_path}"; then
+                echo "✅ Directory .4darchive root already valid after slim — skip sign_bundle_tree"
+              else
+                echo "=== Signing directory .4darchive (sign_bundle_tree) ==="
+                sign_bundle_tree "${product_path}" || exit 1
+              fi
+              ;;
+            *)
+              echo "=== Signing all main components (sign_bundle_tree) ==="
+              sign_bundle_tree "${product_path}" || exit 1
               ;;
           esac
-          echo "=== Signing all main components (sign_bundle_tree) ==="
-          sign_bundle_tree "${product_path}" || exit 1
         else
           echo "=== Skipping étape 1 (product_path is not a directory): ${product_path} ==="
         fi
