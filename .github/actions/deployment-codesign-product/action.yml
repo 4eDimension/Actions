@@ -109,13 +109,19 @@ runs:
         esac
 
         echo "🔎 Scan WebViewerCEF sous le produit uniquement: $product_path"
+        # Nested update.mac.4darchive must stay slim — fat CEF clonefile there breaks the
+        # archive main-binary seal and Apple notary rejects the embedded path (ATE 21R5).
+        find_outside_4darchive() {
+          # $1 = find predicate args after prune; prints NUL-delimited paths
+          find "$product_path" \( -name '*.4darchive' -prune \) -o \( "$@" -print0 \)
+        }
 
         # Fast path: if no helper still has an EXE or CEF symlink, do not touch anything
         # (avoids invalidating intact Developer ID seals → far more codesign skips later).
-        SYMS=$(find "$product_path" -type l \( \
+        SYMS=$(find "$product_path" \( -name '*.4darchive' -prune \) -o \( -type l \( \
           -path '*/4D Helper*.app/Contents/MacOS/*' -o \
           -path '*/4D Helper*.app/Contents/Frameworks/Chromium Embedded Framework.framework' \
-        \) -print -quit 2>/dev/null || true)
+        \) -print \) -quit 2>/dev/null || true)
         if [ -z "$SYMS" ]; then
           # Also need a real CEF dir when helpers exist (missing CEF still requires fix)
           MISSING_CEF=0
@@ -125,7 +131,7 @@ runs:
               MISSING_CEF=1
               break
             fi
-          done < <(find "$product_path" -type d -name "4D Helper*.app" -print0 2>/dev/null)
+          done < <(find_outside_4darchive -type d -name "4D Helper*.app" 2>/dev/null)
           if [ "$MISSING_CEF" -eq 0 ]; then
             echo "⏭️ Helpers déjà normalisés (pas de symlink EXE/CEF) — skip CEF normalize"
             exit 0
@@ -209,7 +215,7 @@ runs:
 
           done < <(find "$BUNDLE_ROOT" -type d -name "4D Helper*.app" -print0)
 
-        done < <(find "$product_path" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0)
+        done < <(find_outside_4darchive -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks")
 
         if [ $FOUND -eq 0 ]; then
           echo "ℹ️ Aucun WebViewerCEF.bundle trouvé sous le produit (ce n’est pas bloquant)"
@@ -286,12 +292,15 @@ runs:
         # mode=devid). Modes:
         #   fast   — leaves on notarized .app: Authority + Timestamp (-dv only)
         #   strict — container seals / .app root: + codesign --verify --strict
-        #   devid  — .4darchive only (never notarized): Authority alone; avoids TSA
-        #            re-sign of DevID leaves that lack Timestamp (ATE v20 ZIP ~40 min)
+        #   devid  — .4darchive: Authority alone (skip TSA on DevID leaves) BUT still
+        #            re-sign when --verify fails — except 4D Helper CEF external symlinks.
+        #            Soft-skipping a broken main binary made Apple notary Invalid when the
+        #            directory archive is embedded under Client.app (ATE 21R5).
         already_signed_ok() {
           local target="$1"
           local mode="${2:-fast}"
           local info
+          local verify_err
           [ -e "$target" ] || return 1
           # Fast path: -dv only. Do NOT require --verify --quiet first — it false-negatives
           # on freshly signed nested dylibs (ATE v20 SignApp/Server: codesign OK then
@@ -303,6 +312,15 @@ runs:
           fi
           if [ "$mode" = "strict" ]; then
             codesign --verify --strict "$target" >/dev/null 2>&1 || return 1
+          elif [ "$mode" = "devid" ]; then
+            if ! codesign --verify --strict "$target" >/dev/null 2>&1; then
+              verify_err=$(codesign --verify --verbose=4 --strict "$target" 2>&1 || true)
+              if echo "$target" | grep -q '4D Helper' \
+                && echo "$verify_err" | grep -qi 'invalid destination for symbolic link'; then
+                return 0
+              fi
+              return 1
+            fi
           fi
           return 0
         }
@@ -693,7 +711,10 @@ runs:
               # valid DevID root seal. Archives are never notarized; do not fail the job.
               if [ "$leaf_skip_mode" = "devid" ]; then
                 echo "⚠️ codesign --verify --strict soft-fail on archive root (slim CEF symlinks OK): $seal_target"
-                if already_signed_ok "$seal_target" devid; then
+                # Authority-only here — already_signed_ok devid also requires verify and
+                # would false-fail this soft path on slim helper CEF layouts.
+                root_info=$(codesign -dv --verbose=2 "$seal_target" 2>&1 || true)
+                if echo "$root_info" | grep -q "Authority=Developer ID Application"; then
                   echo "✅ Archive root still Developer ID — accept without strict verify"
                 else
                   echo "❌ Archive root missing Developer ID after seal: $seal_target"
@@ -930,17 +951,14 @@ runs:
               fi
             fi
             # codesign -dv can still look "signed" when the hash no longer matches.
-            # Slim .4darchive: helper CEF external symlinks + root main binary often report
-            # "invalid destination for symbolic link" / "plist or signature have been modified"
-            # after slim-normalize — accepted when mode=archive (ATE v21/21R5).
+            # Slim .4darchive: only tolerate helper CEF external-symlink verify noise.
+            # Do NOT soft-accept "plist or signature have been modified" on the main
+            # binary — Apple notary rejects that path once embedded in Client.app.
             if ! codesign --verify --strict "$bin" >/dev/null 2>&1; then
               verify_err=$(codesign --verify --verbose=4 --strict "$bin" 2>&1 || true)
-              if echo "$bin" | grep -q '4D Helper' \
-                && echo "$verify_err" | grep -qi 'invalid destination for symbolic link'; then
+              if echo "$verify_err" | grep -qi 'invalid destination for symbolic link' \
+                && { echo "$bin" | grep -q '4D Helper' || [ "$mode" = "archive" ]; }; then
                 echo "ℹ️ Preflight: helper CEF external symlink (accepted for slim archive): $bin"
-              elif [ "$mode" = "archive" ] \
-                && echo "$verify_err" | grep -qiE 'plist or signature have been modified|invalid destination for symbolic link'; then
-                echo "ℹ️ Preflight: slim-archive verify soft-fail (DevID OK): $bin"
               else
                 echo "❌ Preflight: codesign --verify failed: $bin"
                 echo "$verify_err"
@@ -994,12 +1012,11 @@ runs:
               normalize_helpers_slim_under "${product_path}" || exit 1
               # BuildApp often leaves a valid root seal + 4D DevID leaves — full tree
               # walk (codesign -dv × thousands) was 40+ min on ATE v20 SignArchive.
-              # Prefer archive_tree_verifies; else accept DevID root (strict verify often
-              # fails on slim helper CEF symlinks — ATE v21 SignArchive).
+              # Only skip when the root truly verifies. Soft-skipping on DevID alone left
+              # a broken Contents/MacOS main binary that Apple notary rejects once the
+              # directory archive is embedded in Client.app (ATE 21R5 Invalid).
               if archive_tree_verifies "${product_path}"; then
                 echo "✅ Directory .4darchive root already valid after slim — skip sign_bundle_tree"
-              elif already_signed_ok "${product_path}" devid; then
-                echo "✅ Directory .4darchive root Developer ID after slim — skip sign_bundle_tree (strict verify soft)"
               else
                 echo "=== Signing directory .4darchive (sign_bundle_tree, devid) ==="
                 sign_bundle_tree "${product_path}" devid || exit 1
