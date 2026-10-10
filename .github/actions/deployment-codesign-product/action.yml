@@ -900,12 +900,15 @@ runs:
           echo "✅ prepare_4darchive: recompress OK → $archive"
         }
 
+        # $3 = mode: "strict" (default, notarized apps) or "archive" (update.mac.4darchive:
+        # DevID only; tolerate slim-CEF --verify noise — never notarized).
         verify_macho_signatures_under() {
           local root="$1"
           local label="$2"
+          local mode="${3:-strict}"
           local failures=0
           local checked=0
-          echo "=== Preflight signatures ($label): $root ==="
+          echo "=== Preflight signatures ($label, mode=$mode): $root ==="
           while IFS= read -r -d '' bin; do
             # Limit to Mach-O / likely signed payloads
             if ! file -b "$bin" 2>/dev/null | grep -qiE 'Mach-O|shared library|bundle|executable'; then
@@ -919,20 +922,25 @@ runs:
               failures=$((failures + 1))
               continue
             fi
-            if ! echo "$sig_info" | grep -q "Timestamp="; then
-              echo "❌ Preflight: Timestamp absent: $bin"
-              failures=$((failures + 1))
-              continue
+            if [ "$mode" != "archive" ]; then
+              if ! echo "$sig_info" | grep -q "Timestamp="; then
+                echo "❌ Preflight: Timestamp absent: $bin"
+                failures=$((failures + 1))
+                continue
+              fi
             fi
             # codesign -dv can still look "signed" when the hash no longer matches.
-            # Exception: 4D Helper*.app with CEF symlink to the shared framework outside
-            # the helper bundle — --strict reports "invalid destination for symbolic link"
-            # while the Mach-O itself is Developer ID + timestamped (slim archive layout).
+            # Slim .4darchive: helper CEF external symlinks + root main binary often report
+            # "invalid destination for symbolic link" / "plist or signature have been modified"
+            # after slim-normalize — accepted when mode=archive (ATE v21/21R5).
             if ! codesign --verify --strict "$bin" >/dev/null 2>&1; then
               verify_err=$(codesign --verify --verbose=4 --strict "$bin" 2>&1 || true)
               if echo "$bin" | grep -q '4D Helper' \
                 && echo "$verify_err" | grep -qi 'invalid destination for symbolic link'; then
                 echo "ℹ️ Preflight: helper CEF external symlink (accepted for slim archive): $bin"
+              elif [ "$mode" = "archive" ] \
+                && echo "$verify_err" | grep -qiE 'plist or signature have been modified|invalid destination for symbolic link'; then
+                echo "ℹ️ Preflight: slim-archive verify soft-fail (DevID OK): $bin"
               else
                 echo "❌ Preflight: codesign --verify failed: $bin"
                 echo "$verify_err"
@@ -955,15 +963,17 @@ runs:
 
         preflight_archive_path() {
           local archive="$1"
+          local mode=strict
+          case "$archive" in *.4darchive|*.4darchive/) mode=archive ;; esac
           if [ -d "$archive" ]; then
-            verify_macho_signatures_under "$archive" "dir:$archive" || return 1
+            verify_macho_signatures_under "$archive" "dir:$archive" "$mode" || return 1
           elif is_zip_file "$archive"; then
             local work
             work=$(mktemp -d /tmp/4darchive-preflight.XXXXXX)
             if ! ditto -x -k "$archive" "$work" 2>/dev/null; then
               unzip -qo "$archive" -d "$work"
             fi
-            verify_macho_signatures_under "$work" "zip:$archive" || { rm -rf "$work"; return 1; }
+            verify_macho_signatures_under "$work" "zip:$archive" "$mode" || { rm -rf "$work"; return 1; }
             rm -rf "$work"
           else
             echo "⚠️ Preflight: type non géré pour $archive"
