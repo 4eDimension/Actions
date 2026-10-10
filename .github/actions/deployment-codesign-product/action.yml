@@ -282,23 +282,25 @@ runs:
         EXPECTED_TEAM="${team_id:-}"
         echo "ℹ️ Codesign optimize: skip if Developer ID + timestamp (workflow team_id=${EXPECTED_TEAM:-unset})"
 
-        # True when target already has Developer ID Application + secure timestamp.
-        # Pass mode "strict" (containers) to also require codesign --verify --strict.
-        # Leaves use default fast mode: -dv only — full-tree --verify was dominating
-        # wall clock (~30 min on Server) while almost never finding broken DevID leaves.
-        # Container seals + archive preflight still use strict verify.
+        # True when target already has Developer ID Application (+ secure timestamp unless
+        # mode=devid). Modes:
+        #   fast   — leaves on notarized .app: Authority + Timestamp (-dv only)
+        #   strict — container seals / .app root: + codesign --verify --strict
+        #   devid  — .4darchive only (never notarized): Authority alone; avoids TSA
+        #            re-sign of DevID leaves that lack Timestamp (ATE v20 ZIP ~40 min)
         already_signed_ok() {
           local target="$1"
           local mode="${2:-fast}"
           local info
           [ -e "$target" ] || return 1
-          # Fast path: -dv only (Authority + Timestamp). Do NOT require --verify --quiet
-          # first — it false-negatives on freshly signed nested dylibs (ATE v20 SignApp/
-          # Server: codesign OK then "Signature invalide après re-signature" on libxerces /
-          # lib4d-arm64) and forced useless CEF re-signs (errSecInternalComponent storms).
+          # Fast path: -dv only. Do NOT require --verify --quiet first — it false-negatives
+          # on freshly signed nested dylibs (ATE v20 SignApp/Server: codesign OK then
+          # "Signature invalide après re-signature" on libxerces / lib4d-arm64).
           info=$(codesign -dv --verbose=2 "$target" 2>&1 || true)
           echo "$info" | grep -q "Authority=Developer ID Application" || return 1
-          echo "$info" | grep -q "Timestamp=" || return 1
+          if [ "$mode" != "devid" ]; then
+            echo "$info" | grep -q "Timestamp=" || return 1
+          fi
           if [ "$mode" = "strict" ]; then
             codesign --verify --strict "$target" >/dev/null 2>&1 || return 1
           fi
@@ -415,9 +417,12 @@ runs:
         # Sign Mach-O leaves once per inode (CEF hardlinks), deepest path first, no --deep.
         # Then seal containers (.framework / .bundle / .app) deepest-first without --deep
         # (nested leaves already signed). Finally seal root bundle if it has Info.plist.
+        # Optional $2 = leaf skip mode for already_signed_ok (default fast; use devid for
+        # non-notarized .4darchive trees).
         sign_bundle_tree() {
           local bundle="$1"
-          echo "📂 Signing content inside: $bundle"
+          local leaf_skip_mode="${2:-fast}"
+          echo "📂 Signing content inside: $bundle (leaf_skip=${leaf_skip_mode})"
           # bash 3.2 (macOS runners): no associative arrays — track inodes in a temp file
           local inode_log
           inode_log=$(mktemp /tmp/codesign-inodes.XXXXXX)
@@ -430,8 +435,12 @@ runs:
               echo "⏭️  Skip hardlink (inode $inode already signed): $f"
               return 0
             fi
-            if already_signed_ok "$f"; then
-              echo "⏭️  Skip leaf (Developer ID + timestamp): $f"
+            if already_signed_ok "$f" "$leaf_skip_mode"; then
+              if [ "$leaf_skip_mode" = "devid" ]; then
+                echo "⏭️  Skip leaf (Developer ID, archive mode): $f"
+              else
+                echo "⏭️  Skip leaf (Developer ID + timestamp): $f"
+              fi
               [ -n "$inode" ] && echo "$inode" >> "$inode_log"
               return 0
             fi
@@ -466,9 +475,18 @@ runs:
           fi
           while IFS= read -r f; do
             [ -n "$f" ] || continue
-            # Skip expensive file(1) for known Mach-O extensions / helper names
+            # Never treat CEF resources / code-directory blobs as leaves (ATE v20:
+            # fat CEF under helpers marks .pak/CodeResources +x; a broad
+            # */4D Helper* bypass used to skip file(1) and send ~66 non-Mach-O
+            # paths per helper to codesign --timestamp ~40s each).
             case "$f" in
-              *.dylib|*.so|*.bundle/Contents/MacOS/*|*/4D\ Helper*|*/Chromium\ Embedded\ Framework|*/InstallTool|*/Updater) ;;
+              *.pak|*.dat|*.bin|*/Resources/*|*/_CodeSignature/*|*/CodeResources) continue ;;
+            esac
+            # Skip expensive file(1) only for known Mach-O paths — NOT every
+            # path under 4D Helper*.app (that matched .pak / Resources too).
+            case "$f" in
+              *.dylib|*.so|*.bundle/Contents/MacOS/*|*/4D\ Helper*/Contents/MacOS/*|*/Chromium\ Embedded\ Framework|*/InstallTool|*/Updater) ;;
+              */Library/LaunchServices/*|*/XPCServices/*|*.xpc) ;;
               *)
                 if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O|shared library|bundle|executable'; then
                   continue
@@ -491,11 +509,14 @@ runs:
             sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -path "*/Library/LaunchServices/*" -o -path "*/XPCServices/*" \))
 
-          # Seal a container if not already valid (Developer ID + timestamp + strict verify).
+          # Seal a container if not already valid. Notarized .app: strict (DevID+TS+verify).
+          # Archive mode (devid): skip if DevID present — .4darchive is never notarized.
           seal_container() {
             local target="$1"
             local label="$2"
-            if already_signed_ok "$target" strict; then
+            local seal_mode=strict
+            [ "$leaf_skip_mode" = "devid" ] && seal_mode=devid
+            if already_signed_ok "$target" "$seal_mode"; then
               echo "⏭️  Skip $label (already sealed): $target"
               return 0
             fi
@@ -535,8 +556,12 @@ runs:
             local target="$1"
             local out st attempt=1 max_attempts=8 delay=3
             local tmpdir tmpfile size_mb=0 use_inplace=0
-            if already_signed_ok "$target"; then
-              echo "⏭️  Skip opaque (Developer ID + timestamp): $target"
+            if already_signed_ok "$target" "$leaf_skip_mode"; then
+              if [ "$leaf_skip_mode" = "devid" ]; then
+                echo "⏭️  Skip opaque (Developer ID, archive mode): $target"
+              else
+                echo "⏭️  Skip opaque (Developer ID + timestamp): $target"
+              fi
               return 0
             fi
             size_mb=$(du -sm "$target" 2>/dev/null | awk '{print $1}')
@@ -837,7 +862,8 @@ runs:
           echo "ℹ️ Archive root non valide — fix helper exec + CEF symlinks relatifs + sign + recompress (sans copies CEF)"
 
           normalize_helpers_slim_under "$sign_root" || { rm -rf "$work"; return 1; }
-          sign_bundle_tree "$sign_root" || { rm -rf "$work"; return 1; }
+          # devid: archive is never notarized — skip DevID leaves lacking Timestamp
+          sign_bundle_tree "$sign_root" devid || { rm -rf "$work"; return 1; }
 
           if ! archive_tree_verifies "$sign_root"; then
             echo "❌ Signature root invalide AVANT recompress ZIP: $sign_root"
@@ -948,8 +974,8 @@ runs:
               if archive_tree_verifies "${product_path}"; then
                 echo "✅ Directory .4darchive root already valid after slim — skip sign_bundle_tree"
               else
-                echo "=== Signing directory .4darchive (sign_bundle_tree) ==="
-                sign_bundle_tree "${product_path}" || exit 1
+                echo "=== Signing directory .4darchive (sign_bundle_tree, devid) ==="
+                sign_bundle_tree "${product_path}" devid || exit 1
               fi
               ;;
             *)
