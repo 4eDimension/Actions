@@ -42,8 +42,9 @@ inputs:
     required: false
     type: boolean
     default: true
-  # When false, skip étape 2 archive discovery (nested + sibling). Use on SignApp when
-  # Sign-Client-Archive already signed update.mac.4darchive for Server/FTP.
+  # When false, skip étape 2 archive discovery (nested + sibling). Use on SignApp/Server
+  # when Sign-Client-Archive already signed update.mac.4darchive. Also implies
+  # sign_bundle_tree must not mutate nested *.4darchive under the .app.
   sign_archives:
     required: false
     type: boolean
@@ -282,6 +283,20 @@ runs:
           esac
         }
 
+        # True when $1 is (or is inside) a nested *.4darchive relative to $2 (bundle root).
+        # Used to leave Upgrade4DClient/update.mac.4darchive untouched while signing .app —
+        # re-sealing slim CEF helpers there invalidates Contents/MacOS main binary (ATE 21R5 notary Invalid).
+        is_under_nested_4darchive() {
+          local abs="$1"
+          local root="${2%/}"
+          local rel="${abs#"${root}/"}"
+          [[ "$rel" == "$abs" ]] && return 1
+          case "$rel" in
+            *.4darchive|*.4darchive/*) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
         # Expected TeamIdentifier from workflow (Apple Developer Team ID).
         # Used for logging; skip accepts any Developer ID Application + timestamp so
         # pre-signed 4D/CEF binaries are not re-sent to Apple's TSA.
@@ -441,6 +456,17 @@ runs:
           local bundle="$1"
           local leaf_skip_mode="${2:-fast}"
           echo "📂 Signing content inside: $bundle (leaf_skip=${leaf_skip_mode})"
+          # Preserve nested client update archives when signing an .app (or when the
+          # workflow set sign_archives=false after a dedicated SignArchive job).
+          # SignApp used to re-seal 4D Helper*.app / WebViewerCEF inside
+          # Upgrade4DClient/update.mac.4darchive (slim CEF symlinks fail --verify
+          # --strict → forced re-seal) and Apple notary then reported Invalid on
+          # …/update.mac.4darchive/Contents/MacOS/<App> Client (ATE 21R5).
+          local preserve_nested_4darchive=0
+          if [ "$sign_archives" = "false" ] || [[ "$bundle" == *.app ]]; then
+            preserve_nested_4darchive=1
+            echo "ℹ️ preserve nested *.4darchive (sign_archives=${sign_archives}, bundle=$(basename "$bundle"))"
+          fi
           # bash 3.2 (macOS runners): no associative arrays — track inodes in a temp file
           local inode_log
           inode_log=$(mktemp /tmp/codesign-inodes.XXXXXX)
@@ -448,6 +474,9 @@ runs:
           sign_leaf_once() {
             local f="$1"
             local inode
+            if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$f" "$bundle"; then
+              return 0
+            fi
             inode=$(stat -f '%i' "$f" 2>/dev/null || echo "")
             if [ -n "$inode" ] && grep -qx "$inode" "$inode_log" 2>/dev/null; then
               echo "⏭️  Skip hardlink (inode $inode already signed): $f"
@@ -493,6 +522,9 @@ runs:
           fi
           while IFS= read -r f; do
             [ -n "$f" ] || continue
+            if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$f" "$bundle"; then
+              continue
+            fi
             # Never treat CEF resources / code-directory blobs as leaves (ATE v20:
             # fat CEF under helpers marks .pak/CodeResources +x; a broad
             # */4D Helper* bypass used to skip file(1) and send ~66 non-Mach-O
@@ -518,6 +550,9 @@ runs:
           # have missed (odd permissions / names). Notarization rejects unsigned ones.
           while IFS= read -r f; do
             [ -n "$f" ] || continue
+            if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$f" "$bundle"; then
+              continue
+            fi
             case "$f" in
               *.dylib|*.so) ;;
               *)
@@ -545,6 +580,9 @@ runs:
           # 2) Seal frameworks deepest-first (no --deep: leaves already signed)
           while IFS= read -r fw; do
             [ -n "$fw" ] || continue
+            if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$fw" "$bundle"; then
+              continue
+            fi
             seal_container "$fw" "framework" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.framework")
 
@@ -557,6 +595,9 @@ runs:
             [ -n "$app" ] || continue
             # Skip sealing the root bundle here — done in step 5 / étape 3
             [ "$app" = "$bundle" ] && continue
+            if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$app" "$bundle"; then
+              continue
+            fi
             seal_container "$app" "nested .app" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.app")
 
@@ -643,6 +684,9 @@ runs:
           local opaque_f base
           while IFS= read -r opaque_f; do
             [ -n "$opaque_f" ] || continue
+            if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$opaque_f" "$bundle"; then
+              continue
+            fi
             sign_opaque "$opaque_f" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -name "*.4DZ" -o -name "*.4dz" \))
 
@@ -668,6 +712,9 @@ runs:
             [ -n "$db" ] || continue
             [ "$db" = "$bundle" ] && continue
             [ -f "$db/Contents/Info.plist" ] || continue
+            if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$db" "$bundle"; then
+              continue
+            fi
             seal_container "$db" "nested .4dbase" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.4dbase")
 
@@ -675,6 +722,9 @@ runs:
           # WebViewerCEF.bundle is re-sealed after helper .app seals (verify fails → no skip).
           while IFS= read -r bp; do
             [ -n "$bp" ] || continue
+            if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$bp" "$bundle"; then
+              continue
+            fi
             seal_container "$bp" "bundle/plugin/kext" || { rm -f "$inode_log"; return 1; }
           done < <(deepest_first "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \))
 
@@ -1072,7 +1122,17 @@ runs:
             continue
           fi
           if [ -d "$bundle" ]; then
-            echo "ℹ️ Directory package — skip re-sign (étape 1), preflight only: $bundle"
+            # Nested directory .4darchive under .app is no longer mutated in étape 1
+            # (preserve_nested_4darchive). Re-sign here only when verify fails.
+            if [[ "$bundle" == *.4darchive ]] && [[ "${product_path}" == *.app ]] \
+              && ! archive_tree_verifies "$bundle"; then
+              echo "=== Nested directory .4darchive invalid — slim + sign_bundle_tree (devid): $bundle ==="
+              normalize_helpers_slim_under "$bundle" || exit 1
+              sign_bundle_tree "$bundle" devid || exit 1
+              JUST_SIGNED_ARCHIVES+=("$bundle")
+            else
+              echo "ℹ️ Directory package — skip re-sign (étape 1), preflight only: $bundle"
+            fi
             TREATED_ARCHIVES+=("$bundle")
           elif is_zip_file "$bundle"; then
             prepare_and_sign_zip_4darchive "$bundle" || exit 1
