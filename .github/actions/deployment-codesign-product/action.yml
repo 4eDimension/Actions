@@ -525,12 +525,12 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$f" "$bundle"; then
               continue
             fi
-            # Never treat CEF resources / code-directory blobs as leaves (ATE v20:
-            # fat CEF under helpers marks .pak/CodeResources +x; a broad
-            # */4D Helper* bypass used to skip file(1) and send ~66 non-Mach-O
-            # paths per helper to codesign --timestamp ~40s each).
+            # Never treat CEF resource blobs / code-directory as leaves (ATE v20:
+            # fat CEF under helpers marks .pak/CodeResources +x). Do NOT blanket-skip
+            # */Resources/* — Updater.app + Internal *Components/*.4dbase/Libraries
+            # live there and need DevID (ATE v20 SignArchive preflight).
             case "$f" in
-              *.pak|*.dat|*.bin|*/Resources/*|*/_CodeSignature/*|*/CodeResources) continue ;;
+              *.pak|*.dat|*.bin|*/_CodeSignature/*|*/CodeResources) continue ;;
             esac
             # Skip expensive file(1) only for known Mach-O paths — NOT every
             # path under 4D Helper*.app (that matched .pak / Resources too).
