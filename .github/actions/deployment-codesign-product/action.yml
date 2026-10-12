@@ -468,8 +468,46 @@ runs:
             echo "ℹ️ preserve nested *.4darchive (sign_archives=${sign_archives}, bundle=$(basename "$bundle"))"
           fi
           # bash 3.2 (macOS runners): no associative arrays — track inodes in a temp file
-          local inode_log
+          local inode_log leaf_fail_log
           inode_log=$(mktemp /tmp/codesign-inodes.XXXXXX)
+          leaf_fail_log=$(mktemp /tmp/codesign-leaf-fail.XXXXXX)
+          # Fat CEF normalize clonefiles shared CEF into each 4D Helper*.app (distinct
+          # inodes) — SignApp/Server then paid TSA 4× for the same libs (~15–20 min,
+          # ATE v20 wall 2h12). Sign shared CEF once, then re-clone into helpers.
+          is_helper_nested_cef_path() {
+            case "$1" in
+              */4D\ Helper*/Contents/Frameworks/Chromium\ Embedded\ Framework.framework|/*) return 0 ;;
+              */4D\ Helper*/Contents/Frameworks/Chromium\ Embedded\ Framework.framework) return 0 ;;
+            esac
+            return 1
+          }
+
+          reclone_signed_cef_into_helpers() {
+            local root="$1"
+            local fw_dir shared helper dest
+            while IFS= read -r -d '' fw_dir; do
+              shared="$fw_dir/Chromium Embedded Framework.framework"
+              [ -d "$shared" ] || continue
+              case "$shared" in */4D\ Helper*/Contents/Frameworks/*) continue ;; esac
+              echo "📚 Propagate signed shared CEF → helpers under: $fw_dir"
+              for helper in "$fw_dir"/4D\ Helper*.app; do
+                [ -d "$helper" ] || continue
+                dest="$helper/Contents/Frameworks/Chromium Embedded Framework.framework"
+                if [ -L "$dest" ]; then
+                  echo "⏭️  Helper CEF symlink (slim archive) — keep: $helper"
+                  continue
+                fi
+                rm -rf "$dest"
+                mkdir -p "$(dirname "$dest")"
+                if cp -cR "$shared" "$dest" 2>/dev/null; then
+                  echo "📚 CEF clonefile (post-sign) → $dest"
+                else
+                  /usr/bin/ditto "$shared" "$dest"
+                  echo "📚 CEF ditto (post-sign) → $dest"
+                fi
+              done
+            done < <(find -P "$root" -type d -path "*/WebViewerCEF.bundle/Contents/Frameworks" -print0 2>/dev/null)
+          }
 
           sign_leaf_once() {
             local f="$1"
@@ -478,22 +516,58 @@ runs:
               return 0
             fi
             inode=$(stat -f '%i' "$f" 2>/dev/null || echo "")
+            # Serialize inode_log updates (parallel leaf workers).
+            while ! mkdir "${inode_log}.lock" 2>/dev/null; do sleep 0.05; done
             if [ -n "$inode" ] && grep -qx "$inode" "$inode_log" 2>/dev/null; then
+              rmdir "${inode_log}.lock" 2>/dev/null || true
               echo "⏭️  Skip hardlink (inode $inode already signed): $f"
               return 0
             fi
+            rmdir "${inode_log}.lock" 2>/dev/null || true
             if already_signed_ok "$f" "$leaf_skip_mode"; then
               if [ "$leaf_skip_mode" = "devid" ]; then
                 echo "⏭️  Skip leaf (Developer ID, archive mode): $f"
               else
                 echo "⏭️  Skip leaf (Developer ID + timestamp): $f"
               fi
+              while ! mkdir "${inode_log}.lock" 2>/dev/null; do sleep 0.05; done
               [ -n "$inode" ] && echo "$inode" >> "$inode_log"
+              rmdir "${inode_log}.lock" 2>/dev/null || true
               return 0
             fi
             echo "🔧 Signing leaf: $f"
             retry_codesign "$f" "--timestamp" "" || return 1
+            while ! mkdir "${inode_log}.lock" 2>/dev/null; do sleep 0.05; done
             [ -n "$inode" ] && echo "$inode" >> "$inode_log"
+            rmdir "${inode_log}.lock" 2>/dev/null || true
+            return 0
+          }
+
+          # Parallel TSA: Apple timestamp is the wall-clock bottleneck (~20–60s/leaf).
+          # bash 3.2: no wait -n — poll jobs -rp. Override with CODESIGN_PARALLEL=1 to serialize.
+          local CODESIGN_PARALLEL="${CODESIGN_PARALLEL:-4}"
+          sign_leaf_queued() {
+            local f="$1"
+            if [ "$CODESIGN_PARALLEL" -le 1 ]; then
+              sign_leaf_once "$f" || return 1
+              return 0
+            fi
+            while [ "$(jobs -rp 2>/dev/null | wc -l | tr -d ' ')" -ge "$CODESIGN_PARALLEL" ]; do
+              sleep 0.2
+            done
+            (
+              sign_leaf_once "$f" || echo "$f" >> "$leaf_fail_log"
+            ) &
+            return 0
+          }
+          wait_leaf_workers() {
+            wait || true
+            if [ -s "$leaf_fail_log" ]; then
+              echo "❌ Parallel leaf codesign failures:"
+              cat "$leaf_fail_log"
+              rm -f "$inode_log" "$leaf_fail_log"
+              return 1
+            fi
             return 0
           }
 
@@ -520,9 +594,14 @@ runs:
                    ! -path "$bundle/MacOS/*.app/*" \)
             )
           fi
+          echo "ℹ️ Leaf codesign parallelism: $CODESIGN_PARALLEL"
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$f" "$bundle"; then
+              continue
+            fi
+            # Helper-nested CEF copies: signed via shared framework + reclone (below).
+            if is_helper_nested_cef_path "$f"; then
               continue
             fi
             # Never treat CEF resource blobs / code-directory as leaves (ATE v20:
@@ -543,11 +622,13 @@ runs:
                 fi
                 ;;
             esac
-            sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
+            sign_leaf_queued "$f" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
           done < <(deepest_first "$bundle" "${leaf_find[@]}")
+          wait_leaf_workers || return 1
 
           # 1b) Explicit pass: any Mach-O under LaunchServices / XPCServices we might
           # have missed (odd permissions / names). Notarization rejects unsigned ones.
+          : > "$leaf_fail_log"
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$f" "$bundle"; then
@@ -559,8 +640,13 @@ runs:
                 file -b "$f" 2>/dev/null | grep -qiE 'Mach-O' || continue
                 ;;
             esac
-            sign_leaf_once "$f" || { rm -f "$inode_log"; return 1; }
+            sign_leaf_queued "$f" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -path "*/Library/LaunchServices/*" -o -path "*/XPCServices/*" \))
+          wait_leaf_workers || return 1
+
+          # After shared CEF (+ everything else) is signed, refresh helper copies so we
+          # never TSA-sign the same CEF tree four times.
+          reclone_signed_cef_into_helpers "$bundle"
 
           # Seal a container if not already valid. Notarized .app: strict (DevID+TS+verify).
           # Archive mode (devid): skip if DevID present — .4darchive is never notarized.
@@ -583,7 +669,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$fw" "$bundle"; then
               continue
             fi
-            seal_container "$fw" "framework" || { rm -f "$inode_log"; return 1; }
+            seal_container "$fw" "framework" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.framework")
 
           # 3) Seal nested .app deepest-first BEFORE parent .bundle.
@@ -598,7 +684,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$app" "$bundle"; then
               continue
             fi
-            seal_container "$app" "nested .app" || { rm -f "$inode_log"; return 1; }
+            seal_container "$app" "nested .app" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.app")
 
           # 4) Opaque-sign non-Mach-O nested payloads before sealing a .4dbase/.bundle.
@@ -687,7 +773,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$opaque_f" "$bundle"; then
               continue
             fi
-            sign_opaque "$opaque_f" || { rm -f "$inode_log"; return 1; }
+            sign_opaque "$opaque_f" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -name "*.4DZ" -o -name "*.4dz" \))
 
           if [ -d "$bundle/Contents" ]; then
@@ -701,7 +787,7 @@ runs:
               case "$opaque_f" in
                 *.4DZ|*.4dz) continue ;;
               esac
-              sign_opaque "$opaque_f" || { rm -f "$inode_log"; return 1; }
+              sign_opaque "$opaque_f" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
             done < <(find -P "$bundle/Contents" -maxdepth 1 -type f -print)
           fi
 
@@ -715,7 +801,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$db" "$bundle"; then
               continue
             fi
-            seal_container "$db" "nested .4dbase" || { rm -f "$inode_log"; return 1; }
+            seal_container "$db" "nested .4dbase" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.4dbase")
 
           # 4d) Seal bundles / plugins / kext LAST among nested containers so parent
@@ -725,7 +811,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$bp" "$bundle"; then
               continue
             fi
-            seal_container "$bp" "bundle/plugin/kext" || { rm -f "$inode_log"; return 1; }
+            seal_container "$bp" "bundle/plugin/kext" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
           done < <(deepest_first "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \))
 
           # 5) Sign root MacOS binaries then seal package
@@ -739,7 +825,7 @@ runs:
             if [ -d "$bundle/Contents/MacOS" ]; then
               while IFS= read -r mainbin; do
                 [ -n "$mainbin" ] || continue
-                sign_leaf_once "$mainbin" || { rm -f "$inode_log"; return 1; }
+                sign_leaf_once "$mainbin" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
               done < <(find -P "$bundle/Contents/MacOS" -maxdepth 1 -type f -print)
             fi
           elif [ -f "$bundle/Info.plist" ] && [ -d "$bundle/MacOS" ]; then
@@ -747,11 +833,11 @@ runs:
             seal_target="$(dirname "$bundle")"
             while IFS= read -r mainbin; do
               [ -n "$mainbin" ] || continue
-              sign_leaf_once "$mainbin" || { rm -f "$inode_log"; return 1; }
+              sign_leaf_once "$mainbin" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
             done < <(find -P "$bundle/MacOS" -maxdepth 1 -type f -print)
           fi
 
-          rm -f "$inode_log"
+          rm -f "$inode_log" "$leaf_fail_log"
 
           if [ -n "$seal_target" ] && [ -f "$seal_target/Contents/Info.plist" ]; then
             seal_container "$seal_target" "package root" || return 1
