@@ -468,9 +468,10 @@ runs:
             echo "ℹ️ preserve nested *.4darchive (sign_archives=${sign_archives}, bundle=$(basename "$bundle"))"
           fi
           # bash 3.2 (macOS runners): no associative arrays — track inodes in a temp file
-          local inode_log leaf_fail_log
+          local inode_log leaf_fail_log leaf_pid_log
           inode_log=$(mktemp /tmp/codesign-inodes.XXXXXX)
           leaf_fail_log=$(mktemp /tmp/codesign-leaf-fail.XXXXXX)
+          leaf_pid_log=$(mktemp /tmp/codesign-leaf-pids.XXXXXX)
           # Fat CEF normalize clonefiles shared CEF into each 4D Helper*.app (distinct
           # inodes) — SignApp/Server then paid TSA 4× for the same libs (~15–20 min,
           # ATE v20 wall 2h12). Sign shared CEF once, then re-clone into helpers.
@@ -544,28 +545,54 @@ runs:
           }
 
           # Parallel TSA: Apple timestamp is the wall-clock bottleneck (~20–60s/leaf).
-          # bash 3.2: no wait -n — poll jobs -rp. Override with CODESIGN_PARALLEL=1 to serialize.
+          # NEVER use bare `wait` / `jobs -rp`: the Codesign step heartbeat is a background
+          # job (while true) — bare wait hung forever after "parallelism: 4" with only
+          # heartbeats (ATE 38248392570). Track leaf worker PIDs explicitly.
+          # Override with CODESIGN_PARALLEL=1 to serialize.
           local CODESIGN_PARALLEL="${CODESIGN_PARALLEL:-4}"
+          count_alive_leaf_workers() {
+            local n=0 pid
+            local tmp
+            tmp=$(mktemp /tmp/codesign-pids-alive.XXXXXX)
+            while IFS= read -r pid; do
+              [ -n "$pid" ] || continue
+              if kill -0 "$pid" 2>/dev/null; then
+                echo "$pid" >> "$tmp"
+                n=$((n + 1))
+              fi
+            done < "$leaf_pid_log"
+            mv -f "$tmp" "$leaf_pid_log"
+            echo "$n"
+          }
           sign_leaf_queued() {
             local f="$1"
+            local n
             if [ "$CODESIGN_PARALLEL" -le 1 ]; then
               sign_leaf_once "$f" || return 1
               return 0
             fi
-            while [ "$(jobs -rp 2>/dev/null | wc -l | tr -d ' ')" -ge "$CODESIGN_PARALLEL" ]; do
+            while true; do
+              n=$(count_alive_leaf_workers)
+              [ "$n" -lt "$CODESIGN_PARALLEL" ] && break
               sleep 0.2
             done
             (
               sign_leaf_once "$f" || echo "$f" >> "$leaf_fail_log"
             ) &
+            echo $! >> "$leaf_pid_log"
             return 0
           }
           wait_leaf_workers() {
-            wait || true
+            local pid
+            while IFS= read -r pid; do
+              [ -n "$pid" ] || continue
+              wait "$pid" 2>/dev/null || true
+            done < "$leaf_pid_log"
+            : > "$leaf_pid_log"
             if [ -s "$leaf_fail_log" ]; then
               echo "❌ Parallel leaf codesign failures:"
               cat "$leaf_fail_log"
-              rm -f "$inode_log" "$leaf_fail_log"
+              rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"
               return 1
             fi
             return 0
@@ -622,7 +649,7 @@ runs:
                 fi
                 ;;
             esac
-            sign_leaf_queued "$f" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+            sign_leaf_queued "$f" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
           done < <(deepest_first "$bundle" "${leaf_find[@]}")
           wait_leaf_workers || return 1
 
@@ -640,7 +667,7 @@ runs:
                 file -b "$f" 2>/dev/null | grep -qiE 'Mach-O' || continue
                 ;;
             esac
-            sign_leaf_queued "$f" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+            sign_leaf_queued "$f" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -path "*/Library/LaunchServices/*" -o -path "*/XPCServices/*" \))
           wait_leaf_workers || return 1
 
@@ -669,7 +696,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$fw" "$bundle"; then
               continue
             fi
-            seal_container "$fw" "framework" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+            seal_container "$fw" "framework" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.framework")
 
           # 3) Seal nested .app deepest-first BEFORE parent .bundle.
@@ -684,7 +711,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$app" "$bundle"; then
               continue
             fi
-            seal_container "$app" "nested .app" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+            seal_container "$app" "nested .app" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.app")
 
           # 4) Opaque-sign non-Mach-O nested payloads before sealing a .4dbase/.bundle.
@@ -773,7 +800,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$opaque_f" "$bundle"; then
               continue
             fi
-            sign_opaque "$opaque_f" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+            sign_opaque "$opaque_f" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
           done < <(deepest_first "$bundle" -type f \( -name "*.4DZ" -o -name "*.4dz" \))
 
           if [ -d "$bundle/Contents" ]; then
@@ -787,7 +814,7 @@ runs:
               case "$opaque_f" in
                 *.4DZ|*.4dz) continue ;;
               esac
-              sign_opaque "$opaque_f" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+              sign_opaque "$opaque_f" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
             done < <(find -P "$bundle/Contents" -maxdepth 1 -type f -print)
           fi
 
@@ -801,7 +828,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$db" "$bundle"; then
               continue
             fi
-            seal_container "$db" "nested .4dbase" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+            seal_container "$db" "nested .4dbase" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
           done < <(deepest_first "$bundle" -type d -name "*.4dbase")
 
           # 4d) Seal bundles / plugins / kext LAST among nested containers so parent
@@ -811,7 +838,7 @@ runs:
             if [ "$preserve_nested_4darchive" -eq 1 ] && is_under_nested_4darchive "$bp" "$bundle"; then
               continue
             fi
-            seal_container "$bp" "bundle/plugin/kext" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+            seal_container "$bp" "bundle/plugin/kext" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
           done < <(deepest_first "$bundle" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" \))
 
           # 5) Sign root MacOS binaries then seal package
@@ -825,7 +852,7 @@ runs:
             if [ -d "$bundle/Contents/MacOS" ]; then
               while IFS= read -r mainbin; do
                 [ -n "$mainbin" ] || continue
-                sign_leaf_once "$mainbin" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+                sign_leaf_once "$mainbin" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
               done < <(find -P "$bundle/Contents/MacOS" -maxdepth 1 -type f -print)
             fi
           elif [ -f "$bundle/Info.plist" ] && [ -d "$bundle/MacOS" ]; then
@@ -833,11 +860,11 @@ runs:
             seal_target="$(dirname "$bundle")"
             while IFS= read -r mainbin; do
               [ -n "$mainbin" ] || continue
-              sign_leaf_once "$mainbin" || { rm -f "$inode_log" "$leaf_fail_log"; return 1; }
+              sign_leaf_once "$mainbin" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
             done < <(find -P "$bundle/MacOS" -maxdepth 1 -type f -print)
           fi
 
-          rm -f "$inode_log" "$leaf_fail_log"
+          rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"
 
           if [ -n "$seal_target" ] && [ -f "$seal_target/Contents/Info.plist" ]; then
             seal_container "$seal_target" "package root" || return 1
