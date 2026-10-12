@@ -388,9 +388,9 @@ runs:
               sub=$(echo "$output" | sed -n 's/.*In subcomponent:[[:space:]]*//p' | head -1 | tr -d '\r')
               if [ -n "$sub" ] && [ -e "$sub" ] && [ "$sub" != "$target" ]; then
                 echo "↪️ Unsigned subcomponent — sign first: $sub"
-                # Recurse without deep; ignore failure so outer retry still runs
+                # Recurse without deep. Do NOT burn parent attempts: SignArchive ATE v20
+                # exhausted 5/5 on MacOS main while discovering Frameworks/*.dylib one by one.
                 retry_codesign "$sub" "$timestamp_flag" "" || true
-                attempt=$(( attempt + 1 ))
                 continue
               fi
             fi
@@ -544,12 +544,12 @@ runs:
             return 0
           }
 
-          # Parallel TSA: Apple timestamp is the wall-clock bottleneck (~20–60s/leaf).
-          # NEVER use bare `wait` / `jobs -rp`: the Codesign step heartbeat is a background
-          # job (while true) — bare wait hung forever after "parallelism: 4" with only
-          # heartbeats (ATE 38248392570). Track leaf worker PIDs explicitly.
-          # Override with CODESIGN_PARALLEL=1 to serialize.
-          local CODESIGN_PARALLEL="${CODESIGN_PARALLEL:-4}"
+          # Parallel TSA (opt-in): default SERIAL. Parallel PID tracking raced on the
+          # pidfile (count_alive mv truncated live workers) and SignArchive only signed
+          # ~1 leaf then sealed frameworks — MacOS main then failed on unsigned dylibs
+          # (ATE 38254484939, 55 min wall). Set CODESIGN_PARALLEL=4 to experiment.
+          # NEVER use bare `wait`: Codesign heartbeat is a background while-true.
+          local CODESIGN_PARALLEL="${CODESIGN_PARALLEL:-1}"
           count_alive_leaf_workers() {
             local n=0 pid
             local tmp
@@ -1199,6 +1199,60 @@ runs:
           echo "=== Skipping étape 1 (product_path is not a directory): ${product_path} ==="
         fi
 
+        # === Étape 1.5 : dylib / framework sanity BEFORE archive preflight ===
+        # Preflight used to run first and fail on Libraries/lib4d-*.dylib (symlink)
+        # that leaf-find missed — 4DZ ARM never reached this pass (ATE 38253345040).
+        if [ -d "${product_path}" ]; then
+          echo "=== Dylib signature sanity pass ==="
+          while IFS= read -r -d '' dylib; do
+            if is_under_nested_archive "$dylib"; then
+              continue
+            fi
+            if already_signed_ok "$dylib"; then
+              continue
+            fi
+            echo "⚠️ Re-signature requise: $dylib"
+            retry_codesign "$dylib" "--timestamp" "" || exit 1
+            if ! already_signed_ok "$dylib"; then
+              sleep 2
+            fi
+            if ! already_signed_ok "$dylib"; then
+              echo "❌ Signature invalide (Developer ID / timestamp) après re-signature: $dylib"
+              codesign -dv --verbose=2 "$dylib" 2>&1 || true
+              exit 1
+            fi
+          done < <(find -P "${product_path}" \( -type f -o -type l \) -name "*.dylib" -print0)
+
+          echo "=== Framework main binary signature sanity pass ==="
+          while IFS= read -r -d '' fw; do
+            if is_under_nested_archive "$fw"; then
+              continue
+            fi
+            fwname="$(basename "$fw" .framework)"
+            main_bin=""
+            candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
+            for c in "${candidates[@]}"; do
+              if [ -f "$c" ] || [ -L "$c" ]; then
+                main_bin="$c"
+                break
+              fi
+            done
+            if [ -z "$main_bin" ]; then
+              main_bin=$(find -L "$fw" -maxdepth 5 \( -type f -o -type l \) -name "$fwname" -print -quit || true)
+            fi
+            [ -n "$main_bin" ] || continue
+            if already_signed_ok "$main_bin"; then
+              continue
+            fi
+            echo "⚠️ Re-signature framework requise: $main_bin"
+            retry_codesign "$main_bin" "--timestamp" "" || exit 1
+            if ! already_signed_ok "$main_bin"; then
+              echo "❌ Signature framework invalide après re-signature: $main_bin"
+              exit 1
+            fi
+          done < <(find -P "${product_path}" -type d -name "*.framework" -print0)
+        fi
+
         # === Étape 2 : ZIP archives only (extract / sign / recompress) ===
         # Directory *.4dbase / *.4darchive are already covered by étape 1
         # (leaves + opaque + nested .4dbase seal). Re-running sign_bundle_tree
@@ -1305,70 +1359,7 @@ runs:
         fi
         fi # sign_archives != false
 
-        # === Étape 2.5 : sanity pass dylibs (verify léger, re-sign seulement si manquant) ===
-        # Nested *.4dbase/* already covered by preflight — skip them here.
-        # Top-level Libraries/*.dylib when product_path IS a .4dbase must still be checked.
-        if [ -d "${product_path}" ]; then
-          echo "=== Dylib signature sanity pass ==="
-          while IFS= read -r -d '' dylib; do
-            if is_under_nested_archive "$dylib"; then
-              continue
-            fi
-            if already_signed_ok "$dylib"; then
-              continue
-            fi
-            echo "⚠️ Re-signature requise: $dylib"
-            retry_codesign "$dylib" "--timestamp" "" || exit 1
-            # Brief pause: Apple TSA metadata can lag behind a successful codesign exit.
-            if ! already_signed_ok "$dylib"; then
-              sleep 2
-            fi
-            if ! already_signed_ok "$dylib"; then
-              echo "❌ Signature invalide (Developer ID / timestamp) après re-signature: $dylib"
-              codesign -dv --verbose=2 "$dylib" 2>&1 || true
-              exit 1
-            fi
-          done < <(find -P "${product_path}" \( -type f -o -type l \) -name "*.dylib" -print0)
-
-          # === Étape 2.6 : sanity pass binaires principaux de frameworks ===
-          echo "=== Framework main binary signature sanity pass ==="
-          while IFS= read -r -d '' fw; do
-            if is_under_nested_archive "$fw"; then
-              continue
-            fi
-            fwname="$(basename "$fw" .framework)"
-            main_bin=""
-
-            candidates=("$fw/Versions/A/$fwname" "$fw/Versions/Current/$fwname" "$fw/$fwname")
-            for c in "${candidates[@]}"; do
-              if [ -f "$c" ]; then
-                main_bin="$c"
-                break
-              fi
-            done
-
-            if [[ -z "$main_bin" ]]; then
-              main_bin=$(find -L "$fw" -maxdepth 5 -type f -name "$fwname" -print -quit || true)
-            fi
-
-            if [[ -z "$main_bin" ]]; then
-              echo "⚠️ Impossible d'identifier le binaire principal pour $fw"
-              continue
-            fi
-
-            if already_signed_ok "$main_bin"; then
-              continue
-            fi
-            echo "⚠️ Re-signature framework main binary requise: $main_bin"
-            retry_codesign "$main_bin" "--timestamp" "" || exit 1
-            if ! already_signed_ok "$main_bin"; then
-              echo "❌ Signature framework invalide après re-signature: $main_bin"
-              exit 1
-            fi
-          done < <(find -L "${product_path}" -type d -name "*.framework" -print0)
-        else
-          echo "=== Skipping dylib/framework sanity passes (product_path is not a directory) ==="
-        fi
+        # Dylib/framework sanity already ran as étape 1.5 (before archive preflight).
 
         # === Étape 3 : seal racine SANS --deep (inside-out déjà fait) ===
         # --deep retraverse tout l'arbre et re-envoie chaque nested code au TSA.
