@@ -603,8 +603,13 @@ runs:
           # Do NOT skip Contents/MacOS/*.app/** — InstallTool.app + LaunchServices
           # helpers (com.4D.Helper) live there and notarization requires them signed
           # (hardened runtime + timestamp). LaunchServices often lack +x.
+          #
+          # Include -type l: compiled .4dbase often has Libraries/lib4d-*.dylib as a
+          # symlink. find -P -type f misses them; preflight find -L then fails with
+          # "Developer ID absent" (ATE 4DZ ARM 38253345040). Stay on -P (no -L) so
+          # slim CEF helper symlinks do not explode the walk into shared CEF.
           local leaf_find=(
-            -type f \(
+            \( -type f -o -type l \) \(
               -perm -111 -o -name "*.dylib" -o -name "*.so"
               -o -path "*/Library/LaunchServices/*"
               -o -path "*/XPCServices/*"
@@ -668,7 +673,7 @@ runs:
                 ;;
             esac
             sign_leaf_queued "$f" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
-          done < <(deepest_first "$bundle" -type f \( -path "*/Library/LaunchServices/*" -o -path "*/XPCServices/*" \))
+          done < <(deepest_first "$bundle" \( -type f -o -type l \) \( -path "*/Library/LaunchServices/*" -o -path "*/XPCServices/*" \))
           wait_leaf_workers || return 1
 
           # After shared CEF (+ everything else) is signed, refresh helper copies so we
@@ -1323,7 +1328,7 @@ runs:
               codesign -dv --verbose=2 "$dylib" 2>&1 || true
               exit 1
             fi
-          done < <(find "${product_path}" -type f -name "*.dylib" -print0)
+          done < <(find -P "${product_path}" \( -type f -o -type l \) -name "*.dylib" -print0)
 
           # === Étape 2.6 : sanity pass binaires principaux de frameworks ===
           echo "=== Framework main binary signature sanity pass ==="
