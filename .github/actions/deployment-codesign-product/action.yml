@@ -367,8 +367,10 @@ runs:
           local timestamp_flag="$2"
           local deep_flag="${3:-}"
           local attempt=1
-          local max_attempts=5
-          local delay=5
+          # 8 attempts: ATE Server 38371517061 burned 5/5 on first CEF leaf with
+          # errSecInternalComponent (keychain flake) before any successful codesign.
+          local max_attempts=8
+          local delay=3
           local sub
           while [ $attempt -le $max_attempts ]; do
             echo "[$attempt/$max_attempts] codesign ${deep_flag:-} de: $target"
@@ -405,11 +407,17 @@ runs:
             fi
             if echo "$output" | grep -qiE "errSecInternalComponent|CSSMERR_CSP_DISABLED|CSSM_ERRCODE_OPERATION_AUTH_DENIED"; then
               refresh_keychain_access
+              # Cap backoff for flaky Security.framework — long sleeps did not help
+              # (ATE 38371517061: 5→80s still errSecInternalComponent).
+              delay=3
             fi
             echo "⚠️ Tentative $attempt échouée, nouvelle tentative dans ${delay}s..."
             attempt=$(( attempt + 1 ))
             sleep $delay
-            delay=$(( delay * 2 ))
+            if ! echo "$output" | grep -qiE "errSecInternalComponent|CSSMERR_CSP_DISABLED|CSSM_ERRCODE_OPERATION_AUTH_DENIED"; then
+              delay=$(( delay * 2 ))
+              [ "$delay" -gt 30 ] && delay=30
+            fi
           done
           echo "❌ Échec après $max_attempts tentatives pour $target"
           return 1
@@ -1176,6 +1184,9 @@ runs:
         # codesign 4D Helper MacOS while Chromium Embedded Framework was still unsigned
         # (Normalize copies CEF into helpers), then abort on "code object is not signed".
         # sign_bundle_tree already does leaves → frameworks → bundles → apps deepest-first.
+        # Warm keychain before first leaf — avoids burning attempts on cold
+        # errSecInternalComponent (ATE Server 38371517061 on libvk_swiftshader).
+        refresh_keychain_access
         if [ -d "${product_path}" ]; then
           case "${product_path}" in
             *.4darchive)
