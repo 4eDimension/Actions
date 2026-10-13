@@ -475,10 +475,16 @@ runs:
           # Fat CEF normalize clonefiles shared CEF into each 4D Helper*.app (distinct
           # inodes) — SignApp/Server then paid TSA 4× for the same libs (~15–20 min,
           # ATE v20 wall 2h12). Sign shared CEF once, then re-clone into helpers.
+          # Skip ONLY CEF copies nested under 4D Helper*.app (signed via shared CEF
+          # + reclone). Pattern must NOT include a lone "|/*" alternative — that
+          # matched every absolute path and skipped ALL leaf signing
+          # (ATE matrix major 38322999546+: SignArchive leaf passes ~0ms, then
+          # Apple Invalid on WebViewerCEF / Client inside Server's embedded archive).
           is_helper_nested_cef_path() {
             case "$1" in
-              */4D\ Helper*/Contents/Frameworks/Chromium\ Embedded\ Framework.framework|/*) return 0 ;;
-              */4D\ Helper*/Contents/Frameworks/Chromium\ Embedded\ Framework.framework) return 0 ;;
+              */4D\ Helper*/Contents/Frameworks/Chromium\ Embedded\ Framework.framework|\
+              */4D\ Helper*/Contents/Frameworks/Chromium\ Embedded\ Framework.framework/*)
+                return 0 ;;
             esac
             return 1
           }
@@ -1198,12 +1204,17 @@ runs:
         fi
 
         # === Étape 1.5 : dylib / framework sanity BEFORE archive preflight ===
-        # Must NOT skip nested *.4dbase/Libraries/lib4d* (ATE 38262070441: preflight
-        # "Developer ID absent" on Internal Components/*/Libraries/lib4d-arm64.dylib).
-        # If anything is re-signed here, parent MacOS seals are invalidated — re-seal.
+        # Must NOT skip nested *.4dbase/Libraries/lib4d*. Match leaf skip mode of the
+        # product: .4darchive uses devid (DevID+verify) so we do NOT re-timestamp
+        # already-valid 4D leaves and invalidate parent seals (Apple Invalid on
+        # WebViewerCEF / Client inside Server Upgrade4DClient archive).
         if [ -d "${product_path}" ]; then
           sanity_resigned=0
-          echo "=== Dylib signature sanity pass ==="
+          sanity_skip_mode=fast
+          case "${product_path}" in
+            *.4darchive|*.4darchive/) sanity_skip_mode=devid ;;
+          esac
+          echo "=== Dylib signature sanity pass (mode=${sanity_skip_mode}) ==="
           while IFS= read -r -d '' dylib; do
             # Skip only nested *.4darchive trees when product is a .app (SignApp).
             # When product IS the .4darchive, nested .4dbase Libraries MUST be checked.
@@ -1218,15 +1229,15 @@ runs:
                 fi
                 ;;
             esac
-            if already_signed_ok "$dylib"; then
+            if already_signed_ok "$dylib" "$sanity_skip_mode"; then
               continue
             fi
             echo "⚠️ Re-signature requise: $dylib"
             retry_codesign "$dylib" "--timestamp" "" || exit 1
-            if ! already_signed_ok "$dylib"; then
+            if ! already_signed_ok "$dylib" "$sanity_skip_mode"; then
               sleep 2
             fi
-            if ! already_signed_ok "$dylib"; then
+            if ! already_signed_ok "$dylib" "$sanity_skip_mode"; then
               echo "❌ Signature invalide (Developer ID / timestamp) après re-signature: $dylib"
               codesign -dv --verbose=2 "$dylib" 2>&1 || true
               exit 1
@@ -1257,31 +1268,42 @@ runs:
               main_bin=$(find -L "$fw" -maxdepth 5 \( -type f -o -type l \) -name "$fwname" -print -quit || true)
             fi
             [ -n "$main_bin" ] || continue
-            if already_signed_ok "$main_bin"; then
+            if already_signed_ok "$main_bin" "$sanity_skip_mode"; then
               continue
             fi
             echo "⚠️ Re-signature framework requise: $main_bin"
             retry_codesign "$main_bin" "--timestamp" "" || exit 1
-            if ! already_signed_ok "$main_bin"; then
+            if ! already_signed_ok "$main_bin" "$sanity_skip_mode"; then
               echo "❌ Signature framework invalide après re-signature: $main_bin"
               exit 1
             fi
             sanity_resigned=1
           done < <(find -P "${product_path}" -type d -name "*.framework" -print0)
 
-          # ATE 38262070441: sanity re-signed libxerces AFTER Client/Updater seals →
-          # preflight "file modified" on MacOS mains. Re-seal deepest-first when needed.
+          # Full inside-out re-seal when sanity mutated leaves — include frameworks +
+          # WebViewerCEF.bundle (Apple Invalid on those when only .app/root were re-sealed).
           if [ "$sanity_resigned" -eq 1 ]; then
-            echo "=== Re-seal after sanity re-signatures ==="
+            echo "=== Re-seal after sanity re-signatures (frameworks → apps → bundles → MacOS → root) ==="
+            while IFS= read -r fw; do
+              [ -n "$fw" ] || continue
+              echo "📘 Re-seal framework after sanity: $fw"
+              retry_codesign "$fw" "--timestamp" "" || exit 1
+            done < <(deepest_first "${product_path}" -type d -name "*.framework")
             while IFS= read -r app; do
               [ -n "$app" ] || continue
               [ "$app" = "${product_path}" ] && continue
               echo "📘 Re-seal nested .app after sanity: $app"
               retry_codesign "$app" "--timestamp" "" || exit 1
-            done < <(find -P "${product_path}" -type d -name "*.app" -print | awk '{print length, $0}' | sort -nr | cut -d' ' -f2-)
+            done < <(deepest_first "${product_path}" -type d -name "*.app")
+            while IFS= read -r bp; do
+              [ -n "$bp" ] || continue
+              echo "📘 Re-seal bundle after sanity: $bp"
+              retry_codesign "$bp" "--timestamp" "" || exit 1
+            done < <(deepest_first "${product_path}" -type d \( -name "*.bundle" -o -name "*.plugin" -o -name "*.kext" -o -name "*.4dbase" \))
             if [ -d "${product_path}/Contents/MacOS" ]; then
               while IFS= read -r mainbin; do
                 [ -n "$mainbin" ] || continue
+                case "$mainbin" in *.app|*.app/*) continue ;; esac
                 echo "📘 Re-sign package MacOS after sanity: $mainbin"
                 retry_codesign "$mainbin" "--timestamp" "" || exit 1
               done < <(find -P "${product_path}/Contents/MacOS" -maxdepth 1 -type f -print)
