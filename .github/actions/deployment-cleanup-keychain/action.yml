@@ -1,0 +1,38 @@
+name: Remove Temporary Keychain
+description: Delete this job's temp keychain only (safe with parallel runners sharing one macOS user)
+inputs:
+  KEYCHAIN_PATH:
+    description: Path to the temp keychain (defaults to $RUNNER_TEMP/temp.keychain-db for legacy jobs)
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Remove temp keychain
+      shell: bash
+      env:
+        KEYCHAIN_PATH: ${{ inputs.KEYCHAIN_PATH }}
+      run: |
+        set +e
+        KC="${KEYCHAIN_PATH:-}"
+        if [ -z "${KC}" ]; then
+          # Legacy fallback only — prefer the explicit path from setup-keychain output
+          KC="${RUNNER_TEMP}/temp.keychain-db"
+        fi
+
+        LOGIN="${HOME}/Library/Keychains/login.keychain-db"
+        [ -e "${HOME}/Library/Keychains/login.keychain" ] && LOGIN="${HOME}/Library/Keychains/login.keychain"
+        CURRENT_DEFAULT=$(security default-keychain -d user 2>/dev/null | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | head -n1 || true)
+
+        # delete-keychain also removes the entry from the user search list
+        if [ -n "${KC}" ]; then
+          security delete-keychain "${KC}" 2>/dev/null || true
+          rm -f "${KC}" "${KC}-db" 2>/dev/null || true
+        fi
+
+        # Only restore default if *this* job owned it — never reset globally (parallel jobs)
+        if [ -n "${CURRENT_DEFAULT}" ] && [ "${CURRENT_DEFAULT}" = "${KC}" ] && [ -e "${LOGIN}" ]; then
+          security default-keychain -s "${LOGIN}" 2>/dev/null || true
+        fi
+
+        echo "✅ Temp keychain cleaned: ${KC}"

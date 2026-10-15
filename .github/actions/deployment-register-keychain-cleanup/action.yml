@@ -1,0 +1,11 @@
+name: Register temp keychain cleanup
+description: Registers a post-job step that removes the temp keychain even if the job fails or is cancelled
+inputs:
+  KEYCHAIN_PATH:
+    description: Path to the temp keychain to remove after the job
+    required: true
+runs:
+  using: node20
+  main: main.js
+  post: cleanup.js
+  post-if: always()

@@ -353,11 +353,19 @@ runs:
           echo "🔄 Refresh keychain access: ${keychain}"
           security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain}" || true
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${keychain}" >/dev/null 2>&1 || true
-          security default-keychain -s "${keychain}" 2>/dev/null || true
-          # Keep temp keychain first in search list (login.keychain can steal focus).
-          EXISTING=$(security list-keychains -d user 2>/dev/null | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | tr '\n' ' ')
-          # shellcheck disable=SC2086
-          security list-keychains -d user -s "${keychain}" ${EXISTING} >/dev/null 2>&1 || true
+          # Do NOT call default-keychain -s here: the default is shared by all runners
+          # under the same macOS user and would race with parallel signing jobs.
+          # codesign is always invoked with an explicit --keychain path.
+          # Keep our keychain first; preserve other jobs' live keychains; drop missing only.
+          KEEP=()
+          while IFS= read -r line; do
+            path=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
+            [ -z "$path" ] && continue
+            [ "$path" = "${keychain}" ] && continue
+            [ -e "$path" ] || continue
+            KEEP+=("$path")
+          done < <(security list-keychains -d user 2>/dev/null)
+          security list-keychains -d user -s "${keychain}" "${KEEP[@]}" >/dev/null 2>&1 || true
           # Warm Securityd identity cache
           security find-identity -v -p codesigning "${keychain}" >/dev/null 2>&1 || true
         }

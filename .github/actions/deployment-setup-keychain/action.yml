@@ -1,6 +1,5 @@
-
 name: Create Temporary Keychain and Install Certificate
-description: 
+description: Create a per-job temp keychain, import the Developer ID cert, and register automatic post-job cleanup
 inputs:
    APPLE_DEVELOPER_ID_CERTIFICATE: 
      required: true
@@ -19,16 +18,34 @@ outputs:
      
 runs:
   using: "composite"
-  steps:  
+  steps:
+    # Unique path per job so parallel self-hosted runners under the same macOS user
+    # do not share one temp.keychain-db or steal each other's default keychain.
+    - name: Resolve keychain path
+      id: path
+      shell: bash
+      run: |
+        set -euo pipefail
+        JOB_SAFE=$(printf '%s' "${GITHUB_JOB}" | tr -c 'A-Za-z0-9._-' '_')
+        KEYCHAIN_PATH="${RUNNER_TEMP}/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${JOB_SAFE}.keychain-db"
+        echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> "$GITHUB_OUTPUT"
+        echo "🔑 Keychain path: ${KEYCHAIN_PATH}"
+
+    # Register post-job cleanup before create so cancelled/failed jobs still remove the entry.
+    # Full repo path required: relative ./ resolves against the consumer workspace, not this action.
+    - name: Register keychain cleanup
+      uses: 4eDimension/Actions/.github/actions/deployment-register-keychain-cleanup@main
+      with:
+        KEYCHAIN_PATH: ${{ steps.path.outputs.KEYCHAIN_PATH }}
 
     - name: setup keychain
       id: setup
       run: |
         set -euo pipefail
         CERTIFICATE_PATH="${RUNNER_TEMP}/Developer ID Application.p12"
-        echo "CERTIFICATE_PATH=${CERTIFICATE_PATH}" >> $GITHUB_OUTPUT
-        KEYCHAIN_PATH="${RUNNER_TEMP}/temp.keychain-db"
-        echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> $GITHUB_OUTPUT
+        KEYCHAIN_PATH="${RESOLVED_KEYCHAIN_PATH}"
+        echo "CERTIFICATE_PATH=${CERTIFICATE_PATH}" >> "$GITHUB_OUTPUT"
+        echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> "$GITHUB_OUTPUT"
 
         echo -n "${APPLE_DEVELOPER_ID_CERTIFICATE}" | base64 --decode > "${CERTIFICATE_PATH}"
 
@@ -41,11 +58,25 @@ runs:
         security set-keychain-settings "${KEYCHAIN_PATH}"
         security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
 
-        # Prefer our keychain first in the user search list (keep existing ones).
-        EXISTING=$(security list-keychains -d user | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | tr '\n' ' ')
-        security list-keychains -d user -s "${KEYCHAIN_PATH}" ${EXISTING}
+        # Prefer our keychain first. Keep other runners' live keychains; only drop missing paths.
+        KEEP=()
+        while IFS= read -r line; do
+          path=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
+          [ -z "$path" ] && continue
+          [ "$path" = "${KEYCHAIN_PATH}" ] && continue
+          [ -e "$path" ] || continue
+          KEEP+=("$path")
+        done < <(security list-keychains -d user 2>/dev/null)
+        security list-keychains -d user -s "${KEYCHAIN_PATH}" "${KEEP[@]}"
 
-        security default-keychain -s "${KEYCHAIN_PATH}"
+        # Never steal the user default keychain (shared across parallel runners).
+        # codesign/productsign are invoked with an explicit --keychain / -k path.
+        LOGIN="${HOME}/Library/Keychains/login.keychain-db"
+        [ -e "${HOME}/Library/Keychains/login.keychain" ] && LOGIN="${HOME}/Library/Keychains/login.keychain"
+        CURRENT_DEFAULT=$(security default-keychain -d user 2>/dev/null | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | head -n1 || true)
+        if [ -n "${CURRENT_DEFAULT}" ] && [ ! -e "${CURRENT_DEFAULT}" ] && [ -e "${LOGIN}" ]; then
+          security default-keychain -s "${LOGIN}" || true
+        fi
 
         security import "${CERTIFICATE_PATH}" \
           -P "${APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD}" \
@@ -64,4 +95,5 @@ runs:
         APPLE_DEVELOPER_ID_CERTIFICATE: ${{ inputs.APPLE_DEVELOPER_ID_CERTIFICATE }}
         APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ inputs.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
         KEYCHAIN_PASSWORD: ${{ inputs.KEYCHAIN_PASSWORD }}
+        RESOLVED_KEYCHAIN_PATH: ${{ steps.path.outputs.KEYCHAIN_PATH }}
       shell: bash 
