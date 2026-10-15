@@ -5,7 +5,7 @@ inputs:
     description: Path to the temp keychain to remove after the job
     required: true
 runs:
-  using: node20
+  using: node24
   main: main.js
   post: cleanup.js
   post-if: always()
