@@ -636,6 +636,9 @@ runs:
             fi
             case "$f" in
               *.pak|*.dat|*.bin|*/_CodeSignature/*|*/CodeResources) return 0 ;;
+              # Keep Windows plugin slices unsigned by Apple (dual Mac/Windows packages)
+              */Contents/Windows/*|*/Contents/Windows64/*|*/Contents/Windows32/*|*/Contents/Win32/*|*/Contents/Win64/*|\
+              */Windows/*|*/Windows64/*|*/Windows32/*|*/Win32/*|*/Win64/*) return 0 ;;
             esac
             sign_leaf_queued "$f" || return 1
             return 0
@@ -666,7 +669,8 @@ runs:
                 case "$f" in "$bundle"/MacOS/*.app|"$bundle"/MacOS/*.app/*) ;; *) continue ;; esac
                 ;;
             esac
-            if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O|executable'; then
+            # Mach-O only (avoid PE "executable" false positives)
+            if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O'; then
               continue
             fi
             sign_leaf_if_needed "$f" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
@@ -677,7 +681,7 @@ runs:
           : > "$leaf_fail_log"
           while IFS= read -r f; do
             [ -n "$f" ] || continue
-            if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O|shared library|executable'; then
+            if ! file -b "$f" 2>/dev/null | grep -qiE 'Mach-O'; then
               continue
             fi
             sign_leaf_if_needed "$f" || { rm -f "$inode_log" "$leaf_fail_log" "$leaf_pid_log"; return 1; }
@@ -1113,8 +1117,16 @@ runs:
           local checked=0
           echo "=== Preflight signatures ($label, mode=$mode): $root ==="
           while IFS= read -r -d '' bin; do
-            # Limit to Mach-O / likely signed payloads
-            if ! file -b "$bin" 2>/dev/null | grep -qiE 'Mach-O|shared library|bundle|executable'; then
+            # Dual-platform packages keep Windows plugin slices (e.g. cURL.4DX).
+            # Never require Apple Developer ID on those paths.
+            case "$bin" in
+              */Contents/Windows/*|*/Contents/Windows64/*|*/Contents/Windows32/*|*/Contents/Win32/*|*/Contents/Win64/*|\
+              */Windows/*|*/Windows64/*|*/Windows32/*|*/Win32/*|*/Win64/*)
+                continue
+                ;;
+            esac
+            # Apple Mach-O only — do not match PE "executable" (Windows .4DX / .exe).
+            if ! file -b "$bin" 2>/dev/null | grep -qiE 'Mach-O'; then
               continue
             fi
             checked=$((checked + 1))
