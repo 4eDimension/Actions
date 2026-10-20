@@ -20,6 +20,13 @@ runs:
           KC="${RUNNER_TEMP}/temp.keychain-db"
         fi
 
+        # Never delete the machine's persistent signing keychain (see deployment-setup-keychain):
+        # it is shared by every runner of the machine and setup returns it as KEYCHAIN_PATH.
+        if [ "${KC}" = "${HOME}/Library/Keychains/ci-signing.keychain-db" ]; then
+          echo "ℹ️ Persistent keychain kept: ${KC}"
+          exit 0
+        fi
+
         LOGIN="${HOME}/Library/Keychains/login.keychain-db"
         [ -e "${HOME}/Library/Keychains/login.keychain" ] && LOGIN="${HOME}/Library/Keychains/login.keychain"
         CURRENT_DEFAULT=$(security default-keychain -d user 2>/dev/null | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | head -n1 || true)
