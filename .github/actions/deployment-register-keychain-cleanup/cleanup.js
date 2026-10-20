@@ -42,7 +42,12 @@ const loginCandidates = [
 const login = loginCandidates.find((p) => fs.existsSync(p));
 const currentDefault = defaultKeychain();
 
-if (kc) {
+// Never delete the machine's persistent signing keychain (see deployment-setup-keychain),
+// even if a caller registers it by mistake: it is shared by every runner of the machine.
+const persistentKeychain = path.join(home, 'Library/Keychains/ci-signing.keychain-db');
+if (kc && path.resolve(kc) === persistentKeychain) {
+  console.log(`⚠️ Refusing to delete persistent keychain: ${kc}`);
+} else if (kc) {
   // delete-keychain also removes the entry from the user search list
   run('security', ['delete-keychain', kc]);
   try {

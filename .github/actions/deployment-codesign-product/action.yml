@@ -346,6 +346,18 @@ runs:
         refresh_keychain_access() {
           # Mitigate intermittent errSecInternalComponent on self-hosted Macs:
           # Security framework / keychain ACL can flake mid-job; re-unlock + partition list.
+          # Persistent keychain (see deployment-setup-keychain): its password is in a file on the
+          # machine, not the workflow's KEYCHAIN_PASSWORD. It is shared by every runner of the
+          # machine and already provisioned, so only unlock it: never touch its partition list
+          # or the user search list here.
+          local persistent_keychain="${HOME}/Library/Keychains/ci-signing.keychain-db"
+          local persistent_pw_file="${HOME}/.ci-signing/keychain.pw"
+          if [ -n "${keychain:-}" ] && [ "${keychain}" = "${persistent_keychain}" ] && [ -f "${persistent_pw_file}" ]; then
+            echo "🔄 Refresh persistent keychain access: ${keychain}"
+            security unlock-keychain -p "$(cat "${persistent_pw_file}")" "${keychain}" || true
+            security find-identity -v -p codesigning "${keychain}" >/dev/null 2>&1 || true
+            return 0
+          fi
           if [ -z "${KEYCHAIN_PASSWORD:-}" ] || [ -z "${keychain:-}" ]; then
             echo "⚠️ KEYCHAIN_PASSWORD/keychain manquant — skip keychain refresh"
             return 0

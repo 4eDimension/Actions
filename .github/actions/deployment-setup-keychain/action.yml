@@ -1,5 +1,5 @@
 name: Create Temporary Keychain and Install Certificate
-description: Create a per-job temp keychain, import the Developer ID cert, and register automatic post-job cleanup
+description: Use the machine's persistent signing keychain when provisioned, otherwise create a per-job temp keychain, import the Developer ID cert, and register automatic post-job cleanup
 inputs:
    APPLE_DEVELOPER_ID_CERTIFICATE: 
      required: true
@@ -12,17 +12,58 @@ inputs:
      type: string  
 outputs:
    KEYCHAIN_PATH:
-     value: ${{ steps.setup.outputs.KEYCHAIN_PATH }}
+     value: ${{ steps.persistent.outputs.KEYCHAIN_PATH || steps.setup.outputs.KEYCHAIN_PATH }}
    CERTIFICATE_PATH:
      value: ${{ steps.setup.outputs.CERTIFICATE_PATH }}
+   PERSISTENT:
+     value: ${{ steps.persistent.outputs.PERSISTENT }}
      
 runs:
   using: "composite"
   steps:
+    # Shared Mac runners (several runners under one macOS user) can be provisioned once with
+    # ~/Library/Keychains/ci-signing.keychain-db (Developer ID imported, no lock timeout,
+    # partition list apple-tool:,apple:,codesign:) and its password in ~/.ci-signing/keychain.pw.
+    # Then no job imports the p12 or rewrites the search list, which raced between parallel jobs
+    # and caused errSecInternalComponent. Machines without these files keep the temp keychain flow.
+    - name: Use persistent signing keychain
+      id: persistent
+      shell: bash
+      run: |
+        set -euo pipefail
+        PERSISTENT_KEYCHAIN="${HOME}/Library/Keychains/ci-signing.keychain-db"
+        PERSISTENT_KEYCHAIN_PW_FILE="${HOME}/.ci-signing/keychain.pw"
+        if [ ! -f "${PERSISTENT_KEYCHAIN_PW_FILE}" ]; then
+          echo "PERSISTENT=false" >> "$GITHUB_OUTPUT"
+          echo "ℹ️ No ${PERSISTENT_KEYCHAIN_PW_FILE} — using a per-job temp keychain"
+          exit 0
+        fi
+        if [ ! -f "${PERSISTENT_KEYCHAIN}" ]; then
+          echo "::error::${PERSISTENT_KEYCHAIN_PW_FILE} exists but ${PERSISTENT_KEYCHAIN} is missing"
+          exit 1
+        fi
+        security unlock-keychain -p "$(cat "${PERSISTENT_KEYCHAIN_PW_FILE}")" "${PERSISTENT_KEYCHAIN}"
+        # Only add to the search list when missing: every job writes the same value, so the
+        # read-modify-write can no longer drop another job's keychain.
+        SEARCH_LIST=$(security list-keychains -d user 2>/dev/null || true)
+        if ! grep -qF "${PERSISTENT_KEYCHAIN}" <<< "${SEARCH_LIST}"; then
+          KEEP=()
+          while IFS= read -r line; do
+            path=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
+            [ -n "$path" ] && [ -e "$path" ] && KEEP+=("$path")
+          done <<< "${SEARCH_LIST}"
+          security list-keychains -d user -s "${PERSISTENT_KEYCHAIN}" "${KEEP[@]}"
+        fi
+        security find-identity -v -p codesigning "${PERSISTENT_KEYCHAIN}"
+        echo "PERSISTENT=true" >> "$GITHUB_OUTPUT"
+        echo "KEYCHAIN_PATH=${PERSISTENT_KEYCHAIN}" >> "$GITHUB_OUTPUT"
+        echo "✅ Persistent keychain ready: ${PERSISTENT_KEYCHAIN} (no import, no post-job cleanup)"
+
     # Unique path per job so parallel self-hosted runners under the same macOS user
     # do not share one temp.keychain-db or steal each other's default keychain.
     - name: Resolve keychain path
       id: path
+      if: steps.persistent.outputs.PERSISTENT != 'true'
       shell: bash
       run: |
         set -euo pipefail
@@ -34,12 +75,14 @@ runs:
     # Register post-job cleanup before create so cancelled/failed jobs still remove the entry.
     # Full repo path required: relative ./ resolves against the consumer workspace, not this action.
     - name: Register keychain cleanup
+      if: steps.persistent.outputs.PERSISTENT != 'true'
       uses: 4eDimension/Actions/.github/actions/deployment-register-keychain-cleanup@main
       with:
         KEYCHAIN_PATH: ${{ steps.path.outputs.KEYCHAIN_PATH }}
 
     - name: setup keychain
       id: setup
+      if: steps.persistent.outputs.PERSISTENT != 'true'
       run: |
         set -euo pipefail
         CERTIFICATE_PATH="${RUNNER_TEMP}/Developer ID Application.p12"
