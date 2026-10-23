@@ -1522,6 +1522,12 @@ runs:
       run: |
         set -euo pipefail
 
+        # Keep GHA runner alive during long DMG creation (prevents lost communication).
+        heartbeat() { while true; do echo "… hdiutil alive $(date -u +%H:%M:%S)"; sleep 60; done; }
+        heartbeat &
+        HB_PID=$!
+        trap 'kill $HB_PID 2>/dev/null || true' EXIT
+
         SRC="${product_path}"
         OUT="${dmg_path}"
         VOLNAME="$(basename "${OUT%.dmg}")"
@@ -1590,6 +1596,12 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+
+        # Keep GHA runner alive during notarization upload + Apple wait (up to 30m).
+        heartbeat() { while true; do echo "… notarytool alive $(date -u +%H:%M:%S)"; sleep 60; done; }
+        heartbeat &
+        HB_PID=$!
+        trap 'kill $HB_PID 2>/dev/null || true' EXIT
 
         status_file="${GITHUB_WORKSPACE}/notarization_status.txt"
         log() { echo "$@" >&2; }
