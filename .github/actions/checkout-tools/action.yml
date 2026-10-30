@@ -12,7 +12,9 @@ inputs:
     description: Branch or tag (usually vars.VERSION4D)
     required: true
   path:
-    description: Destination path under GITHUB_WORKSPACE
+    description: >
+      Destination folder. An absolute path (recommended: the runner temp folder + /4d-tools) is used as-is;
+      a relative path is resolved under GITHUB_WORKSPACE and wipes any project folder with that name.
     required: false
     default: tools
   sparse-paths:

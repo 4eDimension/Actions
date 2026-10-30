@@ -58,7 +58,11 @@ git config --global http.lowSpeedTime 60
 git config --global core.compression 0
 git config --global credential.helper ""
 
-DEST_ABS="${GITHUB_WORKSPACE}/${DEST}"
+# Absolute paths (e.g. $RUNNER_TEMP/4d-tools) are used as-is so Tools never lands in, or wipes, a folder of the project.
+case "${DEST}" in
+  /*|[A-Za-z]:\\*|[A-Za-z]:/*) DEST_ABS="${DEST}" ;;
+  *) DEST_ABS="${GITHUB_WORKSPACE}/${DEST}" ;;
+esac
 URL="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
 
 SPARSE_ARGS=()
