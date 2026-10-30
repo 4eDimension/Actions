@@ -1,5 +1,5 @@
 name: "build create packagejson"
-description: "if the file package.json doesn't exist then it is being created with the name in the inputs"
+description: "If package.json is missing, generate it. It is committed and pushed only on a run on main (not a pull request); otherwise it is used for this run only."
 
 inputs:
   name:
@@ -29,42 +29,46 @@ runs:
         if [ ! -f package.json ]; then
           echo "{\"name\": \"${{ inputs.name }}\",\"version\": \"${{ inputs.version }}\",\"description\": \"\",\"main\": \"index.js\",\"type\": \"module\",\"scripts\": {\"release:major\": \"release-it major\",\"release:minor\": \"release-it minor\",\"release:patch\": \"release-it patch\"},\"devDependencies\": {\"dotenv\": \"^16.0.3\",\"form-data\": \"^4.0.0\",\"node-fetch\": \"^3.3.2\",\"release-it\": \"^15.10.1\"},\"engines\": {\"4d\": \">=20.2.0\"},\"keywords\": [],\"author\": \"\",\"license\": \"ISC\",\"dependencies\": {\"commander\": \"^11.0.0\"}}" > package.json
           echo "package.json created."
-          git config --global commit.gpgsign false
-          git add package.json
-          git commit -m "Create package.json"
+          if [[ "$GITHUB_EVENT_NAME" == pull_request* || "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::warning title=package.json missing::package.json is not in the repository. It was generated for this run only and NOT committed (event: $GITHUB_EVENT_NAME, ref: $GITHUB_REF). It is only committed automatically by a run on main: add package.json to main."
+          else
+            git config --global commit.gpgsign false
+            git add package.json
+            git commit -m "Create package.json"
 
-          MAX_RETRIES=3
-          ATTEMPT=1
-          while [ "$ATTEMPT" -le "$MAX_RETRIES" ]; do
-            echo "Push attempt $ATTEMPT/$MAX_RETRIES"
+            MAX_RETRIES=3
+            ATTEMPT=1
+            while [ "$ATTEMPT" -le "$MAX_RETRIES" ]; do
+              echo "Push attempt $ATTEMPT/$MAX_RETRIES"
 
-            git fetch origin main
+              git fetch origin main
 
-            if ! git rebase origin/main; then
-              echo "Rebase failed on attempt $ATTEMPT"
-              git rebase --abort || true
+              if ! git rebase origin/main; then
+                echo "Rebase failed on attempt $ATTEMPT"
+                git rebase --abort || true
+                if [ "$ATTEMPT" -eq "$MAX_RETRIES" ]; then
+                  echo "Unable to rebase after $MAX_RETRIES attempts."
+                  exit 1
+                fi
+                sleep $((2 ** ATTEMPT))
+                ATTEMPT=$((ATTEMPT + 1))
+                continue
+              fi
+
+              if git push origin HEAD:main; then
+                echo "Push succeeded."
+                break
+              fi
+
               if [ "$ATTEMPT" -eq "$MAX_RETRIES" ]; then
-                echo "Unable to rebase after $MAX_RETRIES attempts."
+                echo "Unable to push after $MAX_RETRIES attempts."
                 exit 1
               fi
+
               sleep $((2 ** ATTEMPT))
               ATTEMPT=$((ATTEMPT + 1))
-              continue
-            fi
-
-            if git push origin HEAD:main; then
-              echo "Push succeeded."
-              break
-            fi
-
-            if [ "$ATTEMPT" -eq "$MAX_RETRIES" ]; then
-              echo "Unable to push after $MAX_RETRIES attempts."
-              exit 1
-            fi
-
-            sleep $((2 ** ATTEMPT))
-            ATTEMPT=$((ATTEMPT + 1))
-          done
+            done
+          fi
         else
           echo "package.json already exists."
         fi
