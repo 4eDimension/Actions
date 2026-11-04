@@ -1631,16 +1631,31 @@ runs:
         submission_id=$(jq -r '.id // empty' "$json_file" 2>/dev/null || true)
         status=$(jq -r '.status // empty' "$json_file" 2>/dev/null || true)
 
-        # --wait sometimes prints progress on stderr and final JSON on stdout;
-        # if status empty, fall back to notarytool info.
-        if [[ -n "$submission_id" && -z "$status" ]]; then
+        # If --wait dies while polling Apple (e.g. NSURLErrorDomain -1001 "The request timed out"),
+        # stdout is empty but the upload already succeeded: recover the ID from the failing URL in stderr.
+        if [[ -z "$submission_id" ]]; then
+          submission_id=$(grep -oE 'submissions/[0-9a-fA-F-]{36}' notarytool-submit-wait.stderr.log 2>/dev/null | head -1 | cut -d/ -f2 || true)
+        fi
+
+        # --wait sometimes prints progress on stderr and final JSON on stdout, or is cut by a network error:
+        # resume waiting on the same submission instead of failing a notarization Apple may still accept.
+        if [[ -n "$submission_id" && ( -z "$status" || "$status" == "In Progress" ) ]]; then
           info_file="notarytool-info-final.json"
-          xcrun notarytool info "$submission_id" \
-            --apple-id "$apple_id" \
-            --team-id "$team_id" \
-            --password "$password" \
-            --output-format json >"$info_file" 2>/dev/null || true
-          status=$(jq -r '.status // empty' "$info_file" 2>/dev/null || true)
+          for attempt in 1 2 3; do
+            log "⏳ Reprise de l'attente de la soumission $submission_id (tentative $attempt/3)..."
+            xcrun notarytool wait "$submission_id" \
+              --apple-id "$apple_id" \
+              --team-id "$team_id" \
+              --password "$password" \
+              --timeout 20m \
+              --output-format json >"$info_file" 2>notarytool-wait.stderr.log || true
+            status=$(jq -r '.status // empty' "$info_file" 2>/dev/null || true)
+            if [[ -n "$status" && "$status" != "In Progress" ]]; then
+              break
+            fi
+            head -20 notarytool-wait.stderr.log >&2 || true
+            sleep 30
+          done
         fi
 
         if [[ -z "$status" ]]; then
