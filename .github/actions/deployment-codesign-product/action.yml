@@ -1674,6 +1674,25 @@ runs:
           xcrun stapler staple "$dmg_path"
           xcrun stapler validate "$dmg_path"
           log "✅ Staple OK: $dmg_path"
+
+          # Also staple the signed product so ZIP distribution (without the DMG)
+          # still carries a notarization ticket for Gatekeeper offline checks.
+          product_path="${product_path%/}"
+          if [[ -d "$product_path" ]]; then
+            case "$product_path" in
+              *.app|*.4dbase|*.pkg|*.bundle)
+                log "📎 Staple du produit: $product_path"
+                xcrun stapler staple "$product_path"
+                xcrun stapler validate "$product_path"
+                log "✅ Staple OK: $product_path"
+                ;;
+              *)
+                log "ℹ️ Pas de staple produit (type non supporté): $product_path"
+                ;;
+            esac
+          else
+            log "ℹ️ Pas de staple produit (chemin absent ou non dossier): $product_path"
+          fi
           exit 0
         fi
 
@@ -1696,3 +1715,4 @@ runs:
         team_id: ${{ inputs.team_id }}
         password: ${{ inputs.password }}
         dmg_path: ${{ steps.setup.outputs.dmg_path }}
+        product_path: ${{ inputs.product_path }}
