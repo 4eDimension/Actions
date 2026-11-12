@@ -1677,10 +1677,14 @@ runs:
 
           # Also staple the signed product so ZIP distribution (without the DMG)
           # still carries a notarization ticket for Gatekeeper offline checks.
+          # Apple stapler cannot staple .4dbase bundles (exit 66) — DMG staple is enough.
           product_path="${product_path%/}"
           if [[ -d "$product_path" ]]; then
             case "$product_path" in
-              *.app|*.4dbase|*.pkg|*.bundle)
+              *.4dbase)
+                log "ℹ️ Skip staple produit (.4dbase non supporté par stapler): $product_path"
+                ;;
+              *.app|*.pkg|*.bundle)
                 log "📎 Staple du produit: $product_path"
                 xcrun stapler staple "$product_path"
                 xcrun stapler validate "$product_path"
@@ -1706,6 +1710,62 @@ runs:
               --output-format json || true
           fi
           exit 1
+        fi
+
+        # Transient SubmitFailed (timeout/network, often rc=124): one full resubmit.
+        if [[ "$status" == "SubmitFailed" && "${NOTARY_RESUBMITTED:-0}" != "1" ]]; then
+          log "⚠️ SubmitFailed (rc=$submit_rc) — nouvelle soumission complète…"
+          export NOTARY_RESUBMITTED=1
+          sleep 15
+          json_file="notarytool-submit-wait-retry.json"
+          set +e
+          xcrun notarytool submit "$dmg_path" \
+            --apple-id "$apple_id" \
+            --team-id "$team_id" \
+            --password "$password" \
+            --wait \
+            --timeout 45m \
+            --output-format json >"$json_file" 2>notarytool-submit-wait-retry.stderr.log
+          submit_rc=$?
+          set -e
+          submission_id=$(jq -r '.id // empty' "$json_file" 2>/dev/null || true)
+          status=$(jq -r '.status // empty' "$json_file" 2>/dev/null || true)
+          if [[ -z "$submission_id" ]]; then
+            submission_id=$(grep -oE 'submissions/[0-9a-fA-F-]{36}' notarytool-submit-wait-retry.stderr.log 2>/dev/null | head -1 | cut -d/ -f2 || true)
+          fi
+          if [[ -n "$submission_id" && ( -z "$status" || "$status" == "In Progress" ) ]]; then
+            info_file="notarytool-info-retry.json"
+            xcrun notarytool wait "$submission_id" \
+              --apple-id "$apple_id" \
+              --team-id "$team_id" \
+              --password "$password" \
+              --timeout 20m \
+              --output-format json >"$info_file" 2>/dev/null || true
+            status=$(jq -r '.status // empty' "$info_file" 2>/dev/null || true)
+          fi
+          if [[ -z "$status" && $submit_rc -ne 0 ]]; then
+            status="SubmitFailed"
+          fi
+          echo "$status" > "$status_file"
+          echo "notarization_status=$status" >> "$GITHUB_OUTPUT"
+          if [[ "$status" == "Accepted" ]]; then
+            log "✅ Notarisation réussie après resoumission — staple DMG"
+            xcrun stapler staple "$dmg_path"
+            xcrun stapler validate "$dmg_path"
+            product_path="${product_path%/}"
+            if [[ -d "$product_path" ]]; then
+              case "$product_path" in
+                *.4dbase)
+                  log "ℹ️ Skip staple produit (.4dbase non supporté par stapler): $product_path"
+                  ;;
+                *.app|*.pkg|*.bundle)
+                  xcrun stapler staple "$product_path"
+                  xcrun stapler validate "$product_path"
+                  ;;
+              esac
+            fi
+            exit 0
+          fi
         fi
 
         log "❌ Notarisation échouée: status='$status' rc=$submit_rc"
