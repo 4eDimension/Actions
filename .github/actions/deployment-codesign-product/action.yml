@@ -1556,18 +1556,47 @@ runs:
         rsync -aE --delete "${SRC}" "${MOUNT_DIR}/"
 
         # Catch xattr loss before convert/notarize (components only).
+        # Contents/Info.plist (20R8+): root is a real bundle → codesign --verify --strict.
+        # Flat historical layout (20 LTS): no root seal — verify opaque *.4DZ + Mach-O leaves.
         case "${SRC}" in
           *.4dbase|*.4dbase/)
             COPIED="${MOUNT_DIR}/$(basename "${SRC%/}")"
-            if ! codesign --verify --strict "$COPIED" >/dev/null 2>&1; then
+            dmg_staging_fail() {
               echo "❌ DMG staging lost nested codesign (opaque .4DZ xattrs?) — got:"
               codesign --verify --verbose=4 --strict "$COPIED" 2>&1 || true
               xattr -lr "$COPIED/Contents" 2>/dev/null | grep -E 'com\.apple\.cs\.|\.4DZ' | head -40 || true
+              xattr -lr "$COPIED" 2>/dev/null | grep -E 'com\.apple\.cs\.|\.4DZ' | head -40 || true
               hdiutil detach "${MOUNT_DIR}" || hdiutil detach -force "${MOUNT_DIR}" || true
               rm -rf "${WORKDIR}"
               exit 1
+            }
+            if [ -f "$COPIED/Contents/Info.plist" ]; then
+              if ! codesign --verify --strict "$COPIED" >/dev/null 2>&1; then
+                dmg_staging_fail
+              fi
+              echo "✅ DMG staging preserves codesign (Contents bundle): $COPIED"
+            else
+              echo "ℹ️ Flat package (no Contents/Info.plist) — root codesign N/A; verify .4DZ + Mach-O"
+              fail=0
+              while IFS= read -r -d '' dz; do
+                if ! codesign --verify "$dz" >/dev/null 2>&1; then
+                  echo "❌ Opaque .4DZ lost codesign after rsync: $dz"
+                  codesign --verify --verbose=4 "$dz" 2>&1 || true
+                  fail=1
+                fi
+              done < <(find "$COPIED" -type f -name '*.4DZ' -print0 2>/dev/null)
+              while IFS= read -r -d '' lib; do
+                if ! codesign --verify --strict "$lib" >/dev/null 2>&1; then
+                  echo "❌ Mach-O lost codesign after rsync: $lib"
+                  codesign --verify --verbose=4 --strict "$lib" 2>&1 || true
+                  fail=1
+                fi
+              done < <(find "$COPIED" \( -type f -o -type l \) \( -name '*.dylib' -o -name '*.so' \) -print0 2>/dev/null)
+              if [ "$fail" -ne 0 ]; then
+                dmg_staging_fail
+              fi
+              echo "✅ DMG staging preserves codesign (flat package): $COPIED"
             fi
-            echo "✅ DMG staging preserves codesign: $COPIED"
             ;;
         esac
 
