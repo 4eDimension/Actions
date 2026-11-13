@@ -1549,7 +1549,27 @@ runs:
         hdiutil attach "${WORKDIR}/staging.sparseimage" -nobrowse -noverify -noautoopen -owners on \
           -mountpoint "${MOUNT_DIR}"
 
-        rsync -a --delete "${SRC}" "${MOUNT_DIR}/"
+        # -E (Apple rsync / openrsync): preserve extended attributes. Opaque codesign of
+        # Contents/*.4DZ lives in com.apple.cs.* xattrs — rsync -a alone drops them, so the
+        # sealed .4dbase still verifies on disk but the DMG copy fails Gatekeeper after drag
+        # ("code object is not signed at all / In subcomponent: …/Name.4DZ").
+        rsync -aE --delete "${SRC}" "${MOUNT_DIR}/"
+
+        # Catch xattr loss before convert/notarize (components only).
+        case "${SRC}" in
+          *.4dbase|*.4dbase/)
+            COPIED="${MOUNT_DIR}/$(basename "${SRC%/}")"
+            if ! codesign --verify --strict "$COPIED" >/dev/null 2>&1; then
+              echo "❌ DMG staging lost nested codesign (opaque .4DZ xattrs?) — got:"
+              codesign --verify --verbose=4 --strict "$COPIED" 2>&1 || true
+              xattr -lr "$COPIED/Contents" 2>/dev/null | grep -E 'com\.apple\.cs\.|\.4DZ' | head -40 || true
+              hdiutil detach "${MOUNT_DIR}" || hdiutil detach -force "${MOUNT_DIR}" || true
+              rm -rf "${WORKDIR}"
+              exit 1
+            fi
+            echo "✅ DMG staging preserves codesign: $COPIED"
+            ;;
+        esac
 
         # Démontage
         sync
