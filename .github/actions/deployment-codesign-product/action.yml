@@ -1625,171 +1625,161 @@ runs:
 
         status_file="${GITHUB_WORKSPACE}/notarization_status.txt"
         log() { echo "$@" >&2; }
+        product_path="${product_path%/}"
 
-        log "📦 notarytool submit --wait (timeout 30m)..."
-        json_file="notarytool-submit-wait.json"
-        set +e
-        xcrun notarytool submit "$dmg_path" \
-          --apple-id "$apple_id" \
-          --team-id "$team_id" \
-          --password "$password" \
-          --wait \
-          --timeout 30m \
-          --output-format json >"$json_file" 2>notarytool-submit-wait.stderr.log
-        submit_rc=$?
-        set -e
+        # Submit $1 to notarytool --wait. Sets: status, submission_id, submit_rc.
+        # Retries one full resubmit on transient SubmitFailed.
+        notary_submit_wait() {
+          local artifact="$1"
+          local label="$2"
+          local timeout_m="${3:-30}"
+          local json_file stderr_file info_file attempt
+          local resubmitted=0
 
-        if [[ -s notarytool-submit-wait.stderr.log ]]; then
-          log "📄 stderr:"
-          head -40 notarytool-submit-wait.stderr.log >&2 || true
-        fi
-        if [[ -s "$json_file" ]]; then
-          log "📄 JSON:"
-          head -40 "$json_file" >&2 || true
-        fi
-
-        submission_id=$(jq -r '.id // empty' "$json_file" 2>/dev/null || true)
-        status=$(jq -r '.status // empty' "$json_file" 2>/dev/null || true)
-
-        # If --wait dies while polling Apple (e.g. NSURLErrorDomain -1001 "The request timed out"),
-        # stdout is empty but the upload already succeeded: recover the ID from the failing URL in stderr.
-        if [[ -z "$submission_id" ]]; then
-          submission_id=$(grep -oE 'submissions/[0-9a-fA-F-]{36}' notarytool-submit-wait.stderr.log 2>/dev/null | head -1 | cut -d/ -f2 || true)
-        fi
-
-        # --wait sometimes prints progress on stderr and final JSON on stdout, or is cut by a network error:
-        # resume waiting on the same submission instead of failing a notarization Apple may still accept.
-        if [[ -n "$submission_id" && ( -z "$status" || "$status" == "In Progress" ) ]]; then
-          info_file="notarytool-info-final.json"
-          for attempt in 1 2 3; do
-            log "⏳ Reprise de l'attente de la soumission $submission_id (tentative $attempt/3)..."
-            xcrun notarytool wait "$submission_id" \
+          while true; do
+            log "📦 notarytool submit ($label) --wait (timeout ${timeout_m}m): $artifact"
+            json_file="notarytool-submit-${label}.json"
+            stderr_file="notarytool-submit-${label}.stderr.log"
+            set +e
+            xcrun notarytool submit "$artifact" \
               --apple-id "$apple_id" \
               --team-id "$team_id" \
               --password "$password" \
-              --timeout 20m \
-              --output-format json >"$info_file" 2>notarytool-wait.stderr.log || true
-            status=$(jq -r '.status // empty' "$info_file" 2>/dev/null || true)
-            if [[ -n "$status" && "$status" != "In Progress" ]]; then
-              break
+              --wait \
+              --timeout "${timeout_m}m" \
+              --output-format json >"$json_file" 2>"$stderr_file"
+            submit_rc=$?
+            set -e
+
+            if [[ -s "$stderr_file" ]]; then
+              log "📄 stderr ($label):"
+              head -40 "$stderr_file" >&2 || true
             fi
-            head -20 notarytool-wait.stderr.log >&2 || true
-            sleep 30
+            if [[ -s "$json_file" ]]; then
+              log "📄 JSON ($label):"
+              head -40 "$json_file" >&2 || true
+            fi
+
+            submission_id=$(jq -r '.id // empty' "$json_file" 2>/dev/null || true)
+            status=$(jq -r '.status // empty' "$json_file" 2>/dev/null || true)
+
+            # --wait can die while polling (NSURLErrorDomain -1001): recover ID from stderr URL.
+            if [[ -z "$submission_id" ]]; then
+              submission_id=$(grep -oE 'submissions/[0-9a-fA-F-]{36}' "$stderr_file" 2>/dev/null | head -1 | cut -d/ -f2 || true)
+            fi
+
+            if [[ -n "$submission_id" && ( -z "$status" || "$status" == "In Progress" ) ]]; then
+              info_file="notarytool-info-${label}.json"
+              for attempt in 1 2 3; do
+                log "⏳ Reprise attente $submission_id ($label) tentative $attempt/3..."
+                xcrun notarytool wait "$submission_id" \
+                  --apple-id "$apple_id" \
+                  --team-id "$team_id" \
+                  --password "$password" \
+                  --timeout 20m \
+                  --output-format json >"$info_file" 2>notarytool-wait-${label}.stderr.log || true
+                status=$(jq -r '.status // empty' "$info_file" 2>/dev/null || true)
+                if [[ -n "$status" && "$status" != "In Progress" ]]; then
+                  break
+                fi
+                head -20 notarytool-wait-${label}.stderr.log >&2 || true
+                sleep 30
+              done
+            fi
+
+            if [[ -z "$status" ]]; then
+              if [[ $submit_rc -ne 0 ]]; then
+                status="SubmitFailed"
+              else
+                status="Unknown"
+              fi
+            fi
+
+            if [[ "$status" == "SubmitFailed" && "$resubmitted" -eq 0 ]]; then
+              log "⚠️ SubmitFailed ($label, rc=$submit_rc) — nouvelle soumission complète…"
+              resubmitted=1
+              timeout_m=45
+              sleep 15
+              continue
+            fi
+            break
           done
-        fi
 
-        if [[ -z "$status" ]]; then
-          if [[ $submit_rc -ne 0 ]]; then
-            status="SubmitFailed"
-          else
-            status="Unknown"
-          fi
-        fi
-
-        echo "$status" > "$status_file"
-        echo "notarization_status=$status" >> "$GITHUB_OUTPUT"
-
-        if [[ "$status" == "Accepted" ]]; then
-          log "✅ Notarisation réussie — staple DMG"
-          xcrun stapler staple "$dmg_path"
-          xcrun stapler validate "$dmg_path"
-          log "✅ Staple OK: $dmg_path"
-
-          # Also staple the signed product so ZIP distribution (without the DMG)
-          # still carries a notarization ticket for Gatekeeper offline checks.
-          # Apple stapler cannot staple .4dbase bundles (exit 66) — DMG staple is enough.
-          product_path="${product_path%/}"
-          if [[ -d "$product_path" ]]; then
-            case "$product_path" in
-              *.4dbase)
-                log "ℹ️ Skip staple produit (.4dbase non supporté par stapler): $product_path"
-                ;;
-              *.app|*.pkg|*.bundle)
-                log "📎 Staple du produit: $product_path"
-                xcrun stapler staple "$product_path"
-                xcrun stapler validate "$product_path"
-                log "✅ Staple OK: $product_path"
-                ;;
-              *)
-                log "ℹ️ Pas de staple produit (type non supporté): $product_path"
-                ;;
-            esac
-          else
-            log "ℹ️ Pas de staple produit (chemin absent ou non dossier): $product_path"
-          fi
-          exit 0
-        fi
-
-        if [[ "$status" == "Invalid" ]]; then
-          log "❌ Notarisation rejetée (Invalid)"
-          if [[ -n "$submission_id" ]]; then
-            xcrun notarytool log "$submission_id" \
-              --apple-id "$apple_id" \
-              --team-id "$team_id" \
-              --password "$password" \
-              --output-format json || true
-          fi
-          exit 1
-        fi
-
-        # Transient SubmitFailed (timeout/network, often rc=124): one full resubmit.
-        if [[ "$status" == "SubmitFailed" && "${NOTARY_RESUBMITTED:-0}" != "1" ]]; then
-          log "⚠️ SubmitFailed (rc=$submit_rc) — nouvelle soumission complète…"
-          export NOTARY_RESUBMITTED=1
-          sleep 15
-          json_file="notarytool-submit-wait-retry.json"
-          set +e
-          xcrun notarytool submit "$dmg_path" \
-            --apple-id "$apple_id" \
-            --team-id "$team_id" \
-            --password "$password" \
-            --wait \
-            --timeout 45m \
-            --output-format json >"$json_file" 2>notarytool-submit-wait-retry.stderr.log
-          submit_rc=$?
-          set -e
-          submission_id=$(jq -r '.id // empty' "$json_file" 2>/dev/null || true)
-          status=$(jq -r '.status // empty' "$json_file" 2>/dev/null || true)
-          if [[ -z "$submission_id" ]]; then
-            submission_id=$(grep -oE 'submissions/[0-9a-fA-F-]{36}' notarytool-submit-wait-retry.stderr.log 2>/dev/null | head -1 | cut -d/ -f2 || true)
-          fi
-          if [[ -n "$submission_id" && ( -z "$status" || "$status" == "In Progress" ) ]]; then
-            info_file="notarytool-info-retry.json"
-            xcrun notarytool wait "$submission_id" \
-              --apple-id "$apple_id" \
-              --team-id "$team_id" \
-              --password "$password" \
-              --timeout 20m \
-              --output-format json >"$info_file" 2>/dev/null || true
-            status=$(jq -r '.status // empty' "$info_file" 2>/dev/null || true)
-          fi
-          if [[ -z "$status" && $submit_rc -ne 0 ]]; then
-            status="SubmitFailed"
-          fi
           echo "$status" > "$status_file"
           echo "notarization_status=$status" >> "$GITHUB_OUTPUT"
-          if [[ "$status" == "Accepted" ]]; then
-            log "✅ Notarisation réussie après resoumission — staple DMG"
-            xcrun stapler staple "$dmg_path"
-            xcrun stapler validate "$dmg_path"
-            product_path="${product_path%/}"
-            if [[ -d "$product_path" ]]; then
-              case "$product_path" in
-                *.4dbase)
-                  log "ℹ️ Skip staple produit (.4dbase non supporté par stapler): $product_path"
-                  ;;
-                *.app|*.pkg|*.bundle)
-                  xcrun stapler staple "$product_path"
-                  xcrun stapler validate "$product_path"
-                  ;;
-              esac
-            fi
-            exit 0
-          fi
-        fi
 
-        log "❌ Notarisation échouée: status='$status' rc=$submit_rc"
-        exit 1
+          if [[ "$status" == "Invalid" ]]; then
+            log "❌ Notarisation rejetée Invalid ($label)"
+            if [[ -n "$submission_id" ]]; then
+              xcrun notarytool log "$submission_id" \
+                --apple-id "$apple_id" \
+                --team-id "$team_id" \
+                --password "$password" \
+                --output-format json || true
+            fi
+            return 1
+          fi
+          if [[ "$status" != "Accepted" ]]; then
+            log "❌ Notarisation échouée ($label): status='$status' rc=$submit_rc"
+            return 1
+          fi
+          log "✅ Notarisation Accepted ($label)"
+          return 0
+        }
+
+        staple_product_if_possible() {
+          if [[ ! -d "$product_path" ]]; then
+            log "ℹ️ Pas de staple produit (chemin absent ou non dossier): $product_path"
+            return 0
+          fi
+          case "$product_path" in
+            *.4dbase)
+              # Apple stapler cannot staple .4dbase (exit 66 / kLSDataUnavailableErr).
+              # ZIP distribution relies on online notarization tickets (component ZIP submit above).
+              log "ℹ️ Skip staple produit (.4dbase non supporté par stapler): $product_path"
+              ;;
+            *.app|*.pkg|*.bundle)
+              log "📎 Staple du produit: $product_path"
+              xcrun stapler staple "$product_path"
+              xcrun stapler validate "$product_path"
+              log "✅ Staple OK: $product_path"
+              ;;
+            *)
+              log "ℹ️ Pas de staple produit (type non supporté): $product_path"
+              ;;
+          esac
+        }
+
+        # .4dbase cannot be stapled. Notarizing only the DMG left Gatekeeper saying
+        # "Unnotarized Developer ID" on quarantined ZIP extracts even when opaque
+        # .4DZ signatures were intact (gktool allowed without quarantine, blocked with).
+        # Submit a ditto ZIP of the signed component first so Apple registers CDHash
+        # tickets for the same bytes users download as Argus.zip.
+        case "$product_path" in
+          *.4dbase)
+            if [[ ! -d "$product_path" ]]; then
+              log "❌ product_path .4dbase introuvable pour notarisation ZIP: $product_path"
+              echo "Failed" > "$status_file"
+              echo "notarization_status=Failed" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            COMPONENT_ZIP="${RUNNER_TEMP:-/tmp}/notarize-$(basename "$product_path").zip"
+            rm -f "$COMPONENT_ZIP"
+            log "📦 ditto ZIP du .4dbase pour tickets Gatekeeper (distribution ZIP + quarantaine)…"
+            /usr/bin/ditto -c -k --keepParent "$product_path" "$COMPONENT_ZIP"
+            notary_submit_wait "$COMPONENT_ZIP" "component-zip" 30 || exit 1
+            rm -f "$COMPONENT_ZIP"
+            ;;
+        esac
+
+        notary_submit_wait "$dmg_path" "dmg" 30 || exit 1
+
+        log "✅ Notarisation réussie — staple DMG"
+        xcrun stapler staple "$dmg_path"
+        xcrun stapler validate "$dmg_path"
+        log "✅ Staple OK: $dmg_path"
+        staple_product_if_possible
+        exit 0
       env:
         apple_id: ${{ inputs.apple_id }}
         team_id: ${{ inputs.team_id }}
